@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@opencode/plugin-device",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local Android emulator viewing and session-bound automation for OpenCode Desktop on Windows, Linux, and macOS",
   "keywords": [
     "android",
@@ -35,13 +35,13 @@
     "lint": "oxlint --deny-warnings src script vite.config.ts",
     "fmt": "oxfmt --write --ignore-path .oxfmtignore .",
     "fmt:check": "oxfmt --check --ignore-path .oxfmtignore .",
-    "build": "node node_modules/vite/bin/vite.js build --configLoader runner && bun build src/index.ts --target=node --format=esm --packages=external --outfile=dist/server.js",
+    "bundle": "node node_modules/vite/bin/vite.js build --configLoader runner && bun build src/index.ts --target=node --format=esm --packages=external --outfile=dist/server.js",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "typecheck:tsc": "bun run typecheck",
     "test": "bun test",
     "check": "bun run lint && bun run fmt:check && bun run typecheck && bun test",
     "verify:package": "node script/verify-package.mjs",
-    "prepack": "bun run check && bun run build && bun run verify:package"
+    "release:check": "bun run check && bun run bundle && bun run verify:package"
   },
   "dependencies": {
     "@opencode/plugin": "2.2.2",

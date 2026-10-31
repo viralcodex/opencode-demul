@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -13,7 +13,7 @@ const cli = [
   join(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js"),
   join(dirname(process.execPath), "../lib/node_modules/npm/bin/npm-cli.js"),
   process.env.npm_execpath,
-].find((candidate) => candidate && existsSync(candidate));
+].find((candidate) => candidate && basename(candidate) === "npm-cli.js" && existsSync(candidate));
 assert(cli, "Run with a Node installation that includes npm.");
 const temporary = await realpath(await mkdtemp(join(tmpdir(), "demule-helper-lock-")));
 try {

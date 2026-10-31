@@ -382,9 +382,11 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           "This device handle is no longer attached; open the device again.",
         );
       }
+      if (input.shutdown && found.bootedByUs)
+        await shutdownEmulator({ androidSdkRoot }, found.handle.deviceId);
       attachments.delete(input.handle.token);
       registry.release(input.handle);
-      await teardown(found, input.shutdown ?? false);
+      await teardown(found);
     },
 
     async dispose() {
@@ -392,17 +394,15 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       attachments.clear();
       for (const entry of entries) {
         registry.release(entry.handle);
-        await teardown(entry, false);
+        await teardown(entry);
       }
     },
   };
 
-  async function teardown(entry: Attachment, shutdown: boolean): Promise<void> {
+  async function teardown(entry: Attachment): Promise<void> {
     await entry.automation.run(closeArgs()).catch(() => undefined);
     await entry.hub.stop().catch(() => undefined);
     await rm(entry.stateDir, { recursive: true, force: true }).catch(() => undefined);
-    if (shutdown && entry.bootedByUs)
-      await shutdownEmulator({ androidSdkRoot }, entry.handle.deviceId);
   }
 }
 

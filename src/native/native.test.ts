@@ -33,9 +33,14 @@ import {
 } from "./helpers.js";
 import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
 import { readPngDimensions } from "./png.js";
-import { appendBounded } from "./process.js";
+import { appendBounded, type CommandResult } from "./process.js";
 import { createNativeRuntime } from "./runtime.js";
-import { androidHelperEnv, androidToolPath, resolveAndroidSdkRoot } from "./android.js";
+import {
+  androidHelperEnv,
+  androidToolPath,
+  resolveAndroidSdkRoot,
+  shutdownEmulator,
+} from "./android.js";
 import { Schema } from "effect";
 import { Device } from "../rpc.js";
 
@@ -55,6 +60,35 @@ test("missing Android SDK tools report a prerequisite error rather than an empty
   await expect(
     androidDevices({ androidSdkRoot: "/missing/device-test-sdk" }),
   ).rejects.toMatchObject({ data: { code: "missing-prerequisite" } });
+});
+
+test("Android shutdown reports a missing adb prerequisite", async () => {
+  await expect(
+    shutdownEmulator({ androidSdkRoot: "/missing/device-test-sdk" }, "emulator-fixture"),
+  ).rejects.toMatchObject({ data: { code: "missing-prerequisite", mayHaveExecuted: false } });
+});
+
+test.each([
+  { code: 1, signal: null, timedOut: false, expected: "helper-failed" },
+  { code: null, signal: "SIGKILL", timedOut: true, expected: "timeout" },
+  { code: 0, signal: "SIGTERM", timedOut: false, expected: "helper-failed" },
+] as const)("Android shutdown checks command failure %s", async (input) => {
+  const result: CommandResult = { ...input, stdout: "", stderr: "fixture failure" };
+  await expect(shutdownEmulator({}, "emulator-fixture", async () => result)).rejects.toMatchObject({
+    data: { code: input.expected, mayHaveExecuted: true },
+  });
+});
+
+test("Android shutdown accepts only a successful command result", async () => {
+  await shutdownEmulator(
+    { androidSdkRoot: "/fixture-sdk", timeoutMs: 123 },
+    "emulator-fixture",
+    async (spec) => {
+      expect(spec.args).toEqual(["-s", "emulator-fixture", "emu", "kill"]);
+      expect(spec.timeoutMs).toBe(123);
+      return { code: 0, signal: null, timedOut: false, stdout: "OK", stderr: "" };
+    },
+  );
 });
 
 test("Android SDK defaults and executable paths cover every desktop OS", () => {

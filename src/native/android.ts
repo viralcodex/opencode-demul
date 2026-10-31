@@ -134,13 +134,29 @@ export async function ensureBooted(
 }
 
 // Stop an emulator this runtime started, by serial. Used only for devices booted by the runtime.
-export async function shutdownEmulator(options: AndroidOptions, serial: string): Promise<void> {
+export async function shutdownEmulator(
+  options: AndroidOptions,
+  serial: string,
+  run = runCommand,
+): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 30_000;
-  await runCommand({
+  const result = await run({
     command: androidToolPath("adb", options.androidSdkRoot),
     args: ["-s", serial, "emu", "kill"],
     timeoutMs,
   });
+  if (result.spawnError)
+    throw deviceError(
+      "missing-prerequisite",
+      `Android shutdown could not start: ${result.spawnError}`,
+    );
+  if (result.timedOut) throw deviceError("timeout", "Android shutdown timed out.", true);
+  if (result.code !== 0 || result.signal)
+    throw deviceError(
+      "helper-failed",
+      `Android shutdown failed (${result.signal ?? `exit ${result.code}`}): ${result.stderr.trim() || "adb emu kill failed"}`,
+      true,
+    );
 }
 
 async function waitForSerial(

@@ -1,6 +1,6 @@
 import { Device } from "../rpc.js";
 import { deviceError } from "./errors.js";
-import { spawnProcess, type LongRunningProcess } from "./process.js";
+import { spawnProcess, stopProcess, type LongRunningProcess } from "./process.js";
 import { Option, Schema } from "effect";
 import { parseJson } from "./json.js";
 
@@ -42,6 +42,8 @@ export interface HubOptions {
   deviceId: string;
   // How long to wait for the hub's ready line before giving up.
   readyTimeoutMs?: number;
+  stopGraceMs?: number;
+  stopKillMs?: number;
   env?: Record<string, string>;
 }
 
@@ -115,16 +117,16 @@ export function streamDescriptor(
 export interface HubSession {
   descriptor: Device.StreamDescriptor;
   process: LongRunningProcess;
-  // Stop the hub and await its exit, so no streaming backend outlives the attachment.
+  // Allow 2 seconds for SIGTERM, then 2 seconds for SIGKILL before reporting a cleanup timeout.
   stop(): Promise<void>;
 }
 
-export function startHub(options: HubOptions): Promise<HubSession> {
+export function startHub(options: HubOptions, spawn = spawnProcess): Promise<HubSession> {
   const readyTimeoutMs = options.readyTimeoutMs ?? 60_000;
   return new Promise<HubSession>((resolve, reject) => {
     let settled = false;
     let ready: HubReady | null = null;
-    const process = spawnProcess({
+    const process = spawn({
       command: options.externalNode,
       args: hubArgs(options),
       env: options.env,
@@ -139,15 +141,17 @@ export function startHub(options: HubOptions): Promise<HubSession> {
     });
     const timer = setTimeout(() => {
       if (settled) return;
-      process.stop("SIGKILL");
-      finish(() =>
-        reject(deviceError("timeout", "The device hub did not become ready within the deadline.")),
-      );
+      finish(() => {
+        void stop().then(
+          () =>
+            reject(
+              deviceError("timeout", "The device hub did not become ready within the deadline."),
+            ),
+          reject,
+        );
+      });
     }, readyTimeoutMs);
-    const stop = async () => {
-      process.stop();
-      await process.exited;
-    };
+    const stop = () => stopProcess(process, options.stopGraceMs, options.stopKillMs);
     const finish = (action: () => void) => {
       if (settled) return;
       settled = true;

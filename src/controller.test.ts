@@ -3,15 +3,15 @@ import { createDeviceController } from "./controller.js";
 import { Device } from "./rpc.js";
 import { HandleRegistry } from "./native/handle.js";
 import type { CloseInput, DeviceRuntime } from "./native/runtime.js";
+import { deviceError } from "./native/errors.js";
 
 const caller = { serverID: "server-a", sessionID: "session-a" };
 const selection = { platform: "android", deviceId: "phone" } as const;
 
-function fixture(bootedByUs = false) {
+function fixture() {
   const registry = new HandleRegistry();
   const calls: string[] = [];
   const closes: CloseInput[] = [];
-  const shutdowns: string[] = [];
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const runtime: DeviceRuntime = {
@@ -93,7 +93,6 @@ function fixture(bootedByUs = false) {
       registry.release(input.handle);
       calls.push("close");
       closes.push(input);
-      if (input.shutdown && bootedByUs) shutdowns.push(input.handle.deviceId);
     },
     async dispose() {
       calls.push("dispose");
@@ -104,16 +103,15 @@ function fixture(bootedByUs = false) {
     runtime,
     calls,
     closes,
-    shutdowns,
     started,
     release,
   };
 }
 
-test.each([true, false])(
-  "cancelling an in-flight open requests guarded shutdown, bootedByUs=%s",
-  async (bootedByUs) => {
-    const item = fixture(bootedByUs);
+test.each([false, true])(
+  "cancelled opens request shutdown and retry failed rollback on disposal, failure=%s",
+  async (failure) => {
+    const item = fixture();
     const open = item.runtime.open;
     item.runtime.open = async (input) => {
       item.started.resolve();
@@ -121,6 +119,11 @@ test.each([true, false])(
       return open(input);
     };
     const abort = new AbortController();
+    const close = item.runtime.close;
+    if (failure)
+      item.runtime.close = async () => {
+        throw deviceError("timeout", "shutdown failed", true);
+      };
     const opening = item.controller.open(
       caller,
       { ...selection, boot: true },
@@ -131,16 +134,41 @@ test.each([true, false])(
     await item.started.promise;
     abort.abort();
     item.release.resolve();
-    expect(await outcome).toMatchObject({ name: "AbortError" });
+    expect(await outcome).toMatchObject(
+      failure ? { data: { code: "timeout" } } : { name: "AbortError" },
+    );
     expect(item.controller.state(caller)).toBeNull();
+    if (failure) {
+      item.runtime.close = close;
+      await item.controller.dispose();
+      expect(item.calls).toEqual(["open", "close", "dispose"]);
+      expect(item.closes[0]?.shutdown).toBe(true);
+      return;
+    }
     expect(item.calls).toEqual(["open", "close"]);
     expect(item.closes[0]?.shutdown).toBe(true);
-    expect(item.shutdowns).toEqual(bootedByUs ? [selection.deviceId] : []);
     await item.controller.open(caller, selection, "manual");
     expect(item.calls).toEqual(["open", "close", "open"]);
     await item.controller.dispose();
   },
 );
+
+test("failed shutdown rejects close and preserves the session for retry", async () => {
+  const item = fixture();
+  const opened = await item.controller.open(caller, selection, "manual");
+  const close = item.runtime.close;
+  item.runtime.close = async () => {
+    throw deviceError("timeout", "Android shutdown timed out.", true);
+  };
+  await expect(
+    item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual"),
+  ).rejects.toMatchObject({ data: { code: "timeout", mayHaveExecuted: true } });
+  expect(item.controller.state(caller)?.handle).toEqual(opened.handle);
+  item.runtime.close = close;
+  await item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual");
+  expect(item.controller.state(caller)).toBeNull();
+  await item.controller.dispose();
+});
 
 test("agent access defaults on, can be revoked, and never exposes the stream token in attachment state", async () => {
   const item = fixture();

@@ -27,6 +27,7 @@ interface SharedDevice {
 export function createDeviceController(runtime: DeviceRuntime) {
   const sessions = new Map<string, Attachment>();
   const devices = new Map<string, SharedDevice>();
+  const rollbacks = new Map<string, OpenResult>();
   const handles = new HandleRegistry();
   let transitions = Promise.resolve();
   let disposed = false;
@@ -151,9 +152,13 @@ export function createDeviceController(runtime: DeviceRuntime) {
           );
         const key = deviceKey(input.platform, input.deviceId);
         const existing = devices.get(key);
-        const device = existing?.device ?? (await runtime.open(input));
+        const device = existing?.device ?? rollbacks.get(key) ?? (await runtime.open(input));
         if (signal?.aborted) {
-          if (!existing) await runtime.close({ handle: device.handle, shutdown: true });
+          if (!existing) {
+            rollbacks.set(key, device);
+            await runtime.close({ handle: device.handle, shutdown: true });
+            rollbacks.delete(key);
+          }
           signal.throwIfAborted();
         }
         const physicalKey = deviceKey(device.handle.platform, device.handle.deviceId);
@@ -176,6 +181,7 @@ export function createDeviceController(runtime: DeviceRuntime) {
           agentAccess: true,
         };
         connection.sessions.add(entry);
+        rollbacks.delete(key);
         sessions.set(sessionKey(caller), entry);
         devices.set(key, connection);
         devices.set(physicalKey, connection);
@@ -287,6 +293,10 @@ export function createDeviceController(runtime: DeviceRuntime) {
         sessions.forEach((entry) => handles.release(entry.device.handle));
         sessions.clear();
         devices.clear();
+        for (const [key, device] of rollbacks) {
+          await runtime.close({ handle: device.handle, shutdown: true });
+          rollbacks.delete(key);
+        }
         await runtime.dispose();
       });
     },

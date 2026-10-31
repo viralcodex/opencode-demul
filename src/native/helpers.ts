@@ -53,6 +53,7 @@ async function trustedPath(root: string, path: string): Promise<boolean> {
     if (!metadata) return false;
     if (
       metadata.isSymbolicLink() ||
+      (current === path ? !metadata.isFile() : !metadata.isDirectory()) ||
       (process.getuid && (metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0))
     )
       throw deviceError(
@@ -118,6 +119,7 @@ export async function ensureHelpers(
   const existing = await resolveHelperPaths(dir);
   if (existing) return existing;
 
+  await trustedPath(dir, join(dir, "package.json"));
   // A manifest lets `npm --prefix` treat the directory as its own project, so the install stays local to it.
   await writeFile(
     join(dir, "package.json"),

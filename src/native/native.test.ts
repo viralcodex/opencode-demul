@@ -201,6 +201,18 @@ test.skipIf(process.platform === "win32")(
       await expect(resolveHelperPaths(root)).rejects.toMatchObject({
         data: { code: "missing-prerequisite" },
       });
+      await rm(join(packageRoot, "cli.js"));
+      await mkdir(join(packageRoot, "cli.js"));
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await rm(join(packageRoot, "cli.js"), { recursive: true });
+      const outside = join(directory, "outside.json");
+      await writeFile(outside, "unchanged");
+      await symlink(outside, join(root, "package.json"));
+      await expect(ensureHelpers(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

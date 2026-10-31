@@ -1,5 +1,7 @@
 # Demule
 
+<img width="900" height="567" alt="demo" src="https://github.com/user-attachments/assets/ea5c5be1-c66d-4adc-a0d4-cc3878660152" />
+
 View and control Android emulators from OpenCode Desktop on Windows, Linux, and
 macOS. Includes a Device panel and agent tools.
 

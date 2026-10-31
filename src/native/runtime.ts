@@ -31,7 +31,12 @@ import {
 } from "./android.js";
 import { androidDevices } from "./discovery.js";
 import { HandleRegistry } from "./handle.js";
-import { ensureHelpers, resolveExternalNode, type HelperPaths } from "./helpers.js";
+import {
+  defaultHelperDir,
+  ensureHelpers,
+  resolveExternalNode,
+  type HelperPaths,
+} from "./helpers.js";
 import { sendGesture, startHub, type HubSession } from "./hub.js";
 import { readPngDimensions } from "./png.js";
 
@@ -72,7 +77,7 @@ export interface OpenResult {
 
 export interface RuntimeOptions {
   externalNode?: string;
-  // Where the pinned agent-device and hub helpers are installed. Defaults to a per-user temp directory.
+  // Where the pinned agent-device and hub helpers are installed. Defaults to a private user cache.
   helperDir?: string;
   // The base directory for per-attachment agent-device session directories.
   stateRoot?: string;
@@ -105,7 +110,7 @@ interface Attachment {
 }
 
 export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime {
-  const helperDir = options.helperDir ?? join(tmpdir(), "opencode-device-helpers");
+  const helperDir = options.helperDir ?? defaultHelperDir();
   const stateRoot = options.stateRoot ?? join(tmpdir(), "opencode-device-sessions");
   const androidSdkRoot = resolveAndroidSdkRoot({ root: options.androidSdkRoot });
   const attachments = new Map<string, Attachment>();
@@ -382,9 +387,11 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           "This device handle is no longer attached; open the device again.",
         );
       }
+      if (input.shutdown && found.bootedByUs)
+        await shutdownEmulator({ androidSdkRoot }, found.handle.deviceId);
       attachments.delete(input.handle.token);
       registry.release(input.handle);
-      await teardown(found, input.shutdown ?? false);
+      await teardown(found);
     },
 
     async dispose() {
@@ -392,17 +399,15 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       attachments.clear();
       for (const entry of entries) {
         registry.release(entry.handle);
-        await teardown(entry, false);
+        await teardown(entry);
       }
     },
   };
 
-  async function teardown(entry: Attachment, shutdown: boolean): Promise<void> {
+  async function teardown(entry: Attachment): Promise<void> {
     await entry.automation.run(closeArgs()).catch(() => undefined);
     await entry.hub.stop().catch(() => undefined);
     await rm(entry.stateDir, { recursive: true, force: true }).catch(() => undefined);
-    if (shutdown && entry.bootedByUs)
-      await shutdownEmulator({ androidSdkRoot }, entry.handle.deviceId);
   }
 }
 

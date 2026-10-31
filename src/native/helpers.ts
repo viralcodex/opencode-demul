@@ -1,17 +1,18 @@
-import { readFile, access, mkdir, readdir, realpath, writeFile, lstat } from "node:fs/promises";
+import { readFile, access, mkdir, readdir, realpath, rm, writeFile, lstat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, posix, win32, relative, isAbsolute, sep } from "node:path";
 import { Option, Schema } from "effect";
 import { deviceError } from "./errors.js";
 import { parseJson } from "./json.js";
 import { runCommand } from "./process.js";
+import helperPackage from "./helper-package.json" with { type: "json" };
+import helperLock from "./helper-lock.json" with { type: "json" };
 
-// The helper installation and external-runtime resolution. The two automation helpers run under an external Node, not
-// Electron's embedded one, and install into an isolated, caller-owned directory with exact pins, so the repository's
-// lockfile never churns. Nothing here upgrades system tooling; it installs only these two npm packages on request.
-
-// The exact helper versions, pinned after verifying their npm metadata, source, and MIT licensing.
-export const PINS = { "agent-device": "0.21.35", "expo-device-hub": "0.19.0" } as const;
+export const PINS = helperPackage.dependencies;
+export const HELPER_LOCK_HASH = createHash("sha256")
+  .update(JSON.stringify(helperLock))
+  .digest("hex");
 
 export const MIN_NODE = { major: 22, minor: 19 };
 
@@ -86,29 +87,24 @@ export interface HelperPaths {
 // The npm command that installs the pinned helpers into `dir` without touching any outer lockfile.
 export function installArgs(
   dir: string,
-  node?: string,
-  npmCli?: string,
+  node: string,
+  npmCli: string,
 ): { command: string; args: string[] } {
   return {
-    command: npmCli ? (node ?? "node") : "npm",
+    command: node,
     args: [
-      ...(npmCli ? [npmCli] : []),
-      "install",
+      npmCli,
+      "ci",
       "--prefix",
       dir,
-      "--no-save",
-      "--no-package-lock",
       "--no-audit",
       "--no-fund",
       "--omit=dev",
-      `agent-device@${PINS["agent-device"]}`,
-      `expo-device-hub@${PINS["expo-device-hub"]}`,
+      "--include=optional",
     ],
   };
 }
 
-// Ensure both helpers are installed in `dir` at their pinned versions and return the resolved CLI entry files. When the
-// bins already resolve the install is skipped, so the step is idempotent and offline after the first run.
 export async function ensureHelpers(
   dir: string,
   timeoutMs = 300_000,
@@ -116,23 +112,26 @@ export async function ensureHelpers(
 ): Promise<HelperPaths> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await validateHelperDirectory(dir);
+  const stamp = join(dir, ".helper-lock.sha256");
+  for (const file of [stamp, join(dir, "package.json"), join(dir, "package-lock.json")]) {
+    await trustedPath(dir, file);
+  }
+  const previousHash = await readFile(stamp, "utf8").catch(() => null);
   const existing = await resolveHelperPaths(dir);
-  if (existing) return existing;
+  if (existing && previousHash?.trim() === HELPER_LOCK_HASH) return existing;
 
-  await trustedPath(dir, join(dir, "package.json"));
-  // A manifest lets `npm --prefix` treat the directory as its own project, so the install stays local to it.
-  await writeFile(
-    join(dir, "package.json"),
-    `${JSON.stringify({ name: "opencode-device-helpers", private: true, version: "0.0.0" }, null, 2)}\n`,
-  );
+  await rm(stamp, { force: true });
+  await writeFile(join(dir, "package.json"), `${JSON.stringify(helperPackage, null, 2)}\n`);
+  await writeFile(join(dir, "package-lock.json"), `${JSON.stringify(helperLock, null, 2)}\n`);
   const npmCli = await resolveNpmCli(node);
-  const { command, args } = installArgs(dir, node, npmCli);
+  const projectDir = await realpath(dir);
+  const { command, args } = installArgs(projectDir, node, npmCli);
   const paths = process.platform === "win32" ? win32 : posix;
   const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
   const env = {
     [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter),
   };
-  const result = await runCommand({ command, args, timeoutMs, cwd: dir, env });
+  const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env });
   if (result.code !== 0) {
     const reason =
       result.spawnError ??
@@ -149,6 +148,7 @@ export async function ensureHelpers(
       "missing-prerequisite",
       "The device helpers installed but their CLIs are missing.",
     );
+  await writeFile(stamp, `${HELPER_LOCK_HASH}\n`);
   return resolved;
 }
 

@@ -31,9 +31,16 @@ import {
   resolveExternalNode,
   satisfiesNode,
 } from "./helpers.js";
-import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
+import {
+  hubArgs,
+  LOOPBACK_HOST,
+  parseReady,
+  sendGesture,
+  startHub,
+  streamDescriptor,
+} from "./hub.js";
 import { readPngDimensions } from "./png.js";
-import { appendBounded } from "./process.js";
+import { appendBounded, stopProcess, type LongRunningProcess } from "./process.js";
 import { createNativeRuntime } from "./runtime.js";
 import { androidHelperEnv, androidToolPath, resolveAndroidSdkRoot } from "./android.js";
 import { Schema } from "effect";
@@ -236,6 +243,86 @@ test("manual gestures use authenticated device-scoped routes and report rejectio
   } finally {
     await server.stop(true);
   }
+});
+
+test.each([false, true])(
+  "hub cleanup is bounded and repeatable, ignores SIGTERM=%s",
+  async (ignoresTerm) => {
+    const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+    const signals: NodeJS.Signals[] = [];
+    const process: LongRunningProcess = {
+      pid: undefined,
+      exited: exited.promise,
+      stop: (signal = "SIGTERM") => {
+        signals.push(signal);
+        if (!ignoresTerm || signal === "SIGKILL") exited.resolve({ code: 0, signal });
+      },
+    };
+    const hub = await startHub(
+      {
+        externalNode: "fixture-node",
+        hubCli: "fixture-hub",
+        platform: "android",
+        deviceId: "fixture-device",
+        stopGraceMs: 5,
+        stopKillMs: 5,
+      },
+      (spec) => {
+        queueMicrotask(() => spec.onStdoutLine?.("Local: http://127.0.0.1:3400/?token=fixture"));
+        return process;
+      },
+    );
+    await Promise.all([hub.stop(), hub.stop()]);
+    await hub.stop();
+    expect(signals).toEqual(ignoresTerm ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+  },
+);
+
+test("hub startup rollback awaits bounded forced termination", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    startHub(
+      {
+        externalNode: "fixture-node",
+        hubCli: "fixture-hub",
+        platform: "android",
+        deviceId: "fixture-device",
+        readyTimeoutMs: 5,
+        stopGraceMs: 5,
+        stopKillMs: 5,
+      },
+      () => ({
+        pid: undefined,
+        exited: exited.promise,
+        stop: (signal = "SIGTERM") => {
+          signals.push(signal);
+          if (signal === "SIGKILL") exited.resolve({ code: null, signal });
+        },
+      }),
+    ),
+  ).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+});
+
+test("unobserved process exit releases resources and reports a bounded timeout", async () => {
+  const signals: NodeJS.Signals[] = [];
+  let released = false;
+  const process: LongRunningProcess = {
+    pid: undefined,
+    exited: new Promise(() => undefined),
+    stop: (signal = "SIGTERM") => {
+      signals.push(signal);
+    },
+    release: () => {
+      released = true;
+    },
+  };
+  const stopping = stopProcess(process, 5, 5);
+  expect(stopProcess(process, 5, 5)).toBe(stopping);
+  await expect(stopping).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  expect(released).toBe(true);
 });
 
 test("appendBounded keeps the newest bytes once the cap is reached", () => {

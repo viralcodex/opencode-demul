@@ -153,7 +153,7 @@ export function createDeviceController(runtime: DeviceRuntime) {
         const existing = devices.get(key);
         const device = existing?.device ?? (await runtime.open(input));
         if (signal?.aborted) {
-          if (!existing) await runtime.close({ handle: device.handle });
+          if (!existing) await runtime.close({ handle: device.handle, shutdown: true });
           signal.throwIfAborted();
         }
         const physicalKey = deviceKey(device.handle.platform, device.handle.deviceId);

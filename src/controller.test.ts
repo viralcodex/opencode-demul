@@ -2,14 +2,16 @@ import { expect, test } from "bun:test";
 import { createDeviceController } from "./controller.js";
 import { Device } from "./rpc.js";
 import { HandleRegistry } from "./native/handle.js";
-import type { DeviceRuntime } from "./native/runtime.js";
+import type { CloseInput, DeviceRuntime } from "./native/runtime.js";
 
 const caller = { serverID: "server-a", sessionID: "session-a" };
 const selection = { platform: "android", deviceId: "phone" } as const;
 
-function fixture() {
+function fixture(bootedByUs = false) {
   const registry = new HandleRegistry();
   const calls: string[] = [];
+  const closes: CloseInput[] = [];
+  const shutdowns: string[] = [];
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const runtime: DeviceRuntime = {
@@ -90,35 +92,55 @@ function fixture() {
       registry.require(input.handle);
       registry.release(input.handle);
       calls.push("close");
+      closes.push(input);
+      if (input.shutdown && bootedByUs) shutdowns.push(input.handle.deviceId);
     },
     async dispose() {
       calls.push("dispose");
     },
   };
-  return { controller: createDeviceController(runtime), runtime, calls, started, release };
+  return {
+    controller: createDeviceController(runtime),
+    runtime,
+    calls,
+    closes,
+    shutdowns,
+    started,
+    release,
+  };
 }
 
-test("cancelling an in-flight open releases native resources without attaching the session", async () => {
-  const item = fixture();
-  const open = item.runtime.open;
-  item.runtime.open = async (input) => {
-    item.started.resolve();
-    await item.release.promise;
-    return open(input);
-  };
-  const abort = new AbortController();
-  const opening = item.controller.open(caller, selection, "manual", abort.signal);
-  const outcome = opening.catch((error: unknown) => error);
-  await item.started.promise;
-  abort.abort();
-  item.release.resolve();
-  expect(await outcome).toMatchObject({ name: "AbortError" });
-  expect(item.controller.state(caller)).toBeNull();
-  expect(item.calls).toEqual(["open", "close"]);
-  await item.controller.open(caller, selection, "manual");
-  expect(item.calls).toEqual(["open", "close", "open"]);
-  await item.controller.dispose();
-});
+test.each([true, false])(
+  "cancelling an in-flight open requests guarded shutdown, bootedByUs=%s",
+  async (bootedByUs) => {
+    const item = fixture(bootedByUs);
+    const open = item.runtime.open;
+    item.runtime.open = async (input) => {
+      item.started.resolve();
+      await item.release.promise;
+      return open(input);
+    };
+    const abort = new AbortController();
+    const opening = item.controller.open(
+      caller,
+      { ...selection, boot: true },
+      "manual",
+      abort.signal,
+    );
+    const outcome = opening.catch((error: unknown) => error);
+    await item.started.promise;
+    abort.abort();
+    item.release.resolve();
+    expect(await outcome).toMatchObject({ name: "AbortError" });
+    expect(item.controller.state(caller)).toBeNull();
+    expect(item.calls).toEqual(["open", "close"]);
+    expect(item.closes[0]?.shutdown).toBe(true);
+    expect(item.shutdowns).toEqual(bootedByUs ? [selection.deviceId] : []);
+    await item.controller.open(caller, selection, "manual");
+    expect(item.calls).toEqual(["open", "close", "open"]);
+    await item.controller.dispose();
+  },
+);
 
 test("agent access defaults on, can be revoked, and never exposes the stream token in attachment state", async () => {
   const item = fixture();

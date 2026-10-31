@@ -1,7 +1,17 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect } from "node:net";
 import {
   appsArgs,
   capabilitiesArgs,
@@ -30,12 +40,40 @@ import {
   parseNodeVersion,
   resolveExternalNode,
   satisfiesNode,
+  HELPER_LOCK_HASH,
+  defaultHelperDir,
+  ensureHelpers,
+  PINS,
+  resolveNpmCli,
+  resolveHelperPaths,
+  validateHelperDirectory,
 } from "./helpers.js";
-import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
+import helperPackage from "./helper-package.json" with { type: "json" };
+import helperLock from "./helper-lock.json" with { type: "json" };
+import {
+  hubArgs,
+  LOOPBACK_HOST,
+  parseReady,
+  sendGesture,
+  startHub,
+  streamDescriptor,
+} from "./hub.js";
 import { readPngDimensions } from "./png.js";
-import { appendBounded } from "./process.js";
+import {
+  appendBounded,
+  spawnProcess,
+  stopProcess,
+  type CommandResult,
+  type LongRunningProcess,
+} from "./process.js";
 import { createNativeRuntime } from "./runtime.js";
-import { androidHelperEnv, androidToolPath, resolveAndroidSdkRoot } from "./android.js";
+import {
+  androidHelperEnv,
+  androidToolPath,
+  ensureBooted,
+  resolveAndroidSdkRoot,
+  shutdownEmulator,
+} from "./android.js";
 import { Schema } from "effect";
 import { Device } from "../rpc.js";
 
@@ -55,6 +93,184 @@ test("missing Android SDK tools report a prerequisite error rather than an empty
   await expect(
     androidDevices({ androidSdkRoot: "/missing/device-test-sdk" }),
   ).rejects.toMatchObject({ data: { code: "missing-prerequisite" } });
+});
+
+test("Android shutdown reports a missing adb prerequisite", async () => {
+  await expect(
+    shutdownEmulator({ androidSdkRoot: "/missing/device-test-sdk" }, "emulator-fixture"),
+  ).rejects.toMatchObject({ data: { code: "missing-prerequisite", mayHaveExecuted: false } });
+});
+
+test.each([
+  { code: 1, signal: null, timedOut: false, expected: "helper-failed" },
+  { code: null, signal: "SIGKILL", timedOut: true, expected: "timeout" },
+  { code: 0, signal: "SIGTERM", timedOut: false, expected: "helper-failed" },
+] as const)("Android shutdown checks command failure %s", async (input) => {
+  const result: CommandResult = { ...input, stdout: "", stderr: "fixture failure" };
+  await expect(shutdownEmulator({}, "emulator-fixture", async () => result)).rejects.toMatchObject({
+    data: { code: input.expected, mayHaveExecuted: true },
+  });
+});
+
+test("Android shutdown accepts only a successful command result", async () => {
+  await shutdownEmulator(
+    { androidSdkRoot: "/fixture-sdk", timeoutMs: 123 },
+    "emulator-fixture",
+    async (spec) => {
+      expect(spec.args).toEqual(["-s", "emulator-fixture", "emu", "kill"]);
+      expect(spec.timeoutMs).toBe(123);
+      return { code: 0, signal: null, timedOut: false, stdout: "OK", stderr: "" };
+    },
+  );
+});
+
+test.each([1, null])("Android startup reports immediate child failure, code=%s", async (code) => {
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+      run: async () => ({
+        code: 0,
+        signal: null,
+        stdout: "List of devices attached\n",
+        stderr: "",
+        timedOut: false,
+      }),
+      spawn: (spec) => {
+        spec.onStderrLine?.(`${"x".repeat(8_000)}missing fixture image`);
+        return {
+          pid: undefined,
+          exited: Promise.resolve({ code, signal: null }),
+          stop: (signal = "SIGTERM") => {
+            signals.push(signal);
+          },
+        };
+      },
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "helper-failed", message: expect.stringContaining("missing fixture image") },
+  });
+  expect(signals).toEqual(["SIGTERM"]);
+});
+
+test("Android startup cleanup remains bounded when child exit is unobservable", async () => {
+  let released = false;
+  await expect(
+    ensureBooted({ timeoutMs: 1 }, "fixture-avd", true, {
+      run: async () => ({ code: 0, signal: null, stdout: "", stderr: "", timedOut: false }),
+      spawn: () => ({
+        pid: undefined,
+        exited: new Promise(() => undefined),
+        stop: () => undefined,
+        release: () => {
+          released = true;
+        },
+      }),
+      pollIntervalMs: 1,
+    }),
+  ).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(released).toBe(true);
+});
+
+test("process output retains complete lines and bounds oversized partial lines", async () => {
+  const lines: string[] = [];
+  const child = spawnProcess({
+    command: process.execPath,
+    args: ["--eval", 'process.stdout.write("first\\n" + "x".repeat(100) + "\\nlast\\n");'],
+    maxBytes: 8,
+    onStdoutLine: (line) => lines.push(line),
+  });
+  await child.exited;
+  expect(lines).toEqual(["first", "xxxxxxxx", "last"]);
+});
+
+test("Android cold boot uses only the serial reported by its own child", async () => {
+  let spawned = false;
+  const commands: string[][] = [];
+  const child = {
+    pid: undefined,
+    exited: new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(() => undefined),
+    stop: () => undefined,
+  };
+  const booted = await ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+    run: async (spec) => {
+      commands.push([...spec.args]);
+      const stdout =
+        spec.args[0] === "devices"
+          ? `List of devices attached\n${spawned ? "emulator-5554\tdevice\nemulator-5556\tdevice\n" : ""}`
+          : spec.args.includes("getprop")
+            ? "1\n"
+            : "fixture-avd\nOK\n";
+      return { code: 0, signal: null, stdout, stderr: "", timedOut: false };
+    },
+    spawn: (spec) => {
+      spawned = true;
+      const report = spec.args[spec.args.indexOf("-report-console") + 1]!;
+      const port = Number(report.match(/^tcp:(\d+)/u)?.[1]);
+      const socket = connect(port, "127.0.0.1", () => socket.end("5556"));
+      return child;
+    },
+    pollIntervalMs: 5,
+  });
+  expect(booted).toEqual({ serial: "emulator-5556", bootedByUs: true, process: child });
+  expect(commands.some((args) => args.includes("emulator-5554"))).toBe(false);
+});
+
+test("Android startup detects child exit while waiting for boot completion", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  let spawned = false;
+  await expect(
+    ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+      run: async (spec) => {
+        if (spec.args.includes("getprop")) exited.resolve({ code: 1, signal: null });
+        const stdout =
+          spec.args[0] === "devices"
+            ? `List of devices attached\n${spawned ? "emulator-5556\tdevice\n" : ""}`
+            : spec.args.includes("getprop")
+              ? "0\n"
+              : "fixture-avd\nOK\n";
+        return { code: 0, signal: null, stdout, stderr: "", timedOut: false };
+      },
+      spawn: (spec) => {
+        spawned = true;
+        const report = spec.args[spec.args.indexOf("-report-console") + 1]!;
+        const socket = connect(Number(report.match(/^tcp:(\d+)/u)?.[1]), "127.0.0.1", () =>
+          socket.end("5556"),
+        );
+        spec.onStderrLine?.("fixture boot crash");
+        return { pid: undefined, exited: exited.promise, stop: () => undefined };
+      },
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "helper-failed", message: expect.stringContaining("fixture boot crash") },
+  });
+});
+
+test("Android boot timeout awaits termination of its spawned child", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    ensureBooted({ timeoutMs: 10 }, "fixture-avd", true, {
+      run: async () => ({
+        code: 0,
+        signal: null,
+        stdout: "List of devices attached\n",
+        stderr: "",
+        timedOut: false,
+      }),
+      spawn: () => ({
+        pid: undefined,
+        exited: exited.promise,
+        stop: (signal = "SIGTERM") => {
+          signals.push(signal);
+          exited.resolve({ code: null, signal });
+        },
+      }),
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGTERM"]);
 });
 
 test("Android SDK defaults and executable paths cover every desktop OS", () => {
@@ -148,6 +364,154 @@ test.skipIf(process.platform === "win32")(
   },
 );
 
+test("helper lock pins roots and includes every native optional platform", () => {
+  expect(helperLock.lockfileVersion).toBe(3);
+  expect(helperLock.packages[""].dependencies).toEqual(helperPackage.dependencies);
+  expect(helperLock.packages["node_modules/agent-device"].version).toBe(
+    helperPackage.dependencies["agent-device"],
+  );
+  expect(helperLock.packages["node_modules/expo-device-hub"].version).toBe(
+    helperPackage.dependencies["expo-device-hub"],
+  );
+  const packages: Record<string, { version?: string; resolved?: string; integrity?: string }> =
+    helperLock.packages;
+  for (const [name, version] of Object.entries(
+    helperLock.packages["node_modules/node-datachannel"].optionalDependencies,
+  )) {
+    expect(packages[`node_modules/${name}`]?.version).toBe(version);
+    expect(packages[`node_modules/${name}`]?.integrity).toMatch(/^sha512-/u);
+  }
+  expect(HELPER_LOCK_HASH).toMatch(/^[a-f0-9]{64}$/u);
+});
+
+test.skipIf(process.platform === "win32").each([
+  { nvm: false, symlinked: false },
+  { nvm: true, symlinked: false },
+  { nvm: false, symlinked: true },
+  { nvm: true, symlinked: true },
+])(
+  "POSIX helper installation uses selected Node with restricted PATH: %j",
+  async ({ nvm, symlinked }) => {
+    const directory = await mkdtemp(join(tmpdir(), "device-node-toolchain-"));
+    const saved = {
+      PATH: process.env["PATH"],
+      NVM_DIR: process.env["NVM_DIR"],
+      OPENCODE_DEVICE_NODE: process.env["OPENCODE_DEVICE_NODE"],
+      npm_execpath: process.env["npm_execpath"],
+    };
+    try {
+      const prefix = join(directory, "versions", "node", "v24.1.0");
+      const node = join(prefix, "bin", "node");
+      const npmRoot = symlinked ? join(prefix, "libexec", "lib") : join(prefix, "lib");
+      const cli = join(npmRoot, "node_modules", "npm", "bin", "npm-cli.js");
+      await mkdir(join(prefix, "bin"), { recursive: true });
+      await mkdir(join(npmRoot, "node_modules", "npm", "bin"), { recursive: true });
+      await writeFile(
+        node,
+        `#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'v24.1.0\\n'; elif [ "$1" = "--print" ]; then printf '%s\\n' "$0"; else exec '${process.execPath}' "$@"; fi\n`,
+        { mode: 0o755 },
+      );
+      await writeFile(
+        cli,
+        `const fs = require("node:fs"); const path = require("node:path"); if (process.argv.includes("--version")) { console.log("10.1.0"); } else { const root = process.argv[process.argv.indexOf("--prefix") + 1]; const child = require("node:child_process").spawnSync("node", ["--version"], {encoding:"utf8"}); if (child.stdout.trim() !== "v24.1.0") process.exit(1); for (const [pkg, version] of Object.entries(${JSON.stringify(PINS)})) { const dir = path.join(root, "node_modules", pkg); fs.mkdirSync(dir, {recursive:true}); fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({version, bin:"cli.js"})); fs.writeFileSync(path.join(dir, "cli.js"), ""); } }`,
+      );
+      process.env["PATH"] = join(directory, "missing-path");
+      process.env["NVM_DIR"] = directory;
+      delete process.env["OPENCODE_DEVICE_NODE"];
+      process.env["npm_execpath"] = join(directory, "unrelated", "npm-cli.js");
+      if (symlinked) await symlink(cli, join(prefix, "bin", "npm"));
+      const selected = await resolveExternalNode(nvm ? undefined : node);
+      expect(selected).toBe(node);
+      expect(await resolveNpmCli(selected)).toBe(symlinked ? await realpath(cli) : cli);
+      const paths = await ensureHelpers(join(directory, "helpers"), 10_000, selected);
+      expect(paths.agentDeviceBin).toBe(
+        join(directory, "helpers", "node_modules", "agent-device", "cli.js"),
+      );
+      await rm(cli);
+      await expect(resolveNpmCli(selected)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(process.platform === "win32")(
+  "helper caches reject unsafe ownership, permissions, symlinks and escaped bins",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "device-cache-"));
+    const root = join(directory, "helpers");
+    try {
+      expect(defaultHelperDir("/home/test")).toBe("/home/test/.cache/opencode/device-helpers");
+      await mkdir(root, { mode: 0o700 });
+      await expect(
+        validateHelperDirectory(root, (process.getuid?.() ?? 0) + 1),
+      ).rejects.toMatchObject({ data: { code: "missing-prerequisite" } });
+      await chmod(root, 0o777);
+      await expect(ensureHelpers(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await chmod(root, 0o700);
+      const linked = join(directory, "linked");
+      await symlink(root, linked);
+      await expect(ensureHelpers(linked)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      for (const pkg of Object.keys(PINS) as (keyof typeof PINS)[]) {
+        const packageRoot = join(root, "node_modules", pkg);
+        await mkdir(packageRoot, { recursive: true });
+        await writeFile(
+          join(packageRoot, "package.json"),
+          JSON.stringify({ version: PINS[pkg], bin: "cli.js" }),
+        );
+        await writeFile(join(packageRoot, "cli.js"), "");
+      }
+      expect(await resolveHelperPaths(root)).not.toBeNull();
+      const packageRoot = join(root, "node_modules", "agent-device");
+      await writeFile(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ version: PINS["agent-device"], bin: "../../../outside.js" }),
+      );
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await writeFile(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ version: PINS["agent-device"], bin: "cli.js" }),
+      );
+      await rm(join(packageRoot, "cli.js"));
+      await symlink(join(packageRoot, "package.json"), join(packageRoot, "cli.js"));
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await rm(join(packageRoot, "cli.js"));
+      await mkdir(join(packageRoot, "cli.js"));
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await rm(join(packageRoot, "cli.js"), { recursive: true });
+      const outside = join(directory, "outside.json");
+      await writeFile(outside, "unchanged");
+      for (const name of ["package.json", "package-lock.json", ".helper-lock.sha256"]) {
+        const target = join(root, name);
+        await symlink(outside, target);
+        await expect(ensureHelpers(root)).rejects.toMatchObject({
+          data: { code: "missing-prerequisite" },
+        });
+        expect(await readFile(outside, "utf8")).toBe("unchanged");
+        await rm(target);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test("Windows helper installation uses Node and npm CLI without a shell", () => {
   const node = "C:\\Program Files\\nodejs\\node.exe";
   const cli = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
@@ -161,8 +525,9 @@ test("Windows helper installation uses Node and npm CLI without a shell", () => 
   expect(invocation.command).toBe(node);
   expect(invocation.args[0]).toBe(cli);
   expect(invocation.args).toContain("C:\\Device Helpers");
-  expect(invocation.args).toContain("--no-save");
-  expect(invocation.args).toContain("--no-package-lock");
+  expect(invocation.args).toContain("ci");
+  expect(invocation.args).toContain("--include=optional");
+  expect(invocation.args).not.toContain("--no-package-lock");
 });
 
 test("manual gestures use authenticated device-scoped routes and report rejection", async () => {
@@ -236,6 +601,108 @@ test("manual gestures use authenticated device-scoped routes and report rejectio
   } finally {
     await server.stop(true);
   }
+});
+
+test.each([false, true])(
+  "hub cleanup is bounded and repeatable, ignores SIGTERM=%s",
+  async (ignoresTerm) => {
+    const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+    const signals: NodeJS.Signals[] = [];
+    const process: LongRunningProcess = {
+      pid: undefined,
+      exited: exited.promise,
+      stop: (signal = "SIGTERM") => {
+        signals.push(signal);
+        if (!ignoresTerm || signal === "SIGKILL") exited.resolve({ code: 0, signal });
+      },
+    };
+    const hub = await startHub(
+      {
+        externalNode: "fixture-node",
+        hubCli: "fixture-hub",
+        platform: "android",
+        deviceId: "fixture-device",
+        stopGraceMs: 5,
+        stopKillMs: 5,
+      },
+      (spec) => {
+        queueMicrotask(() => spec.onStdoutLine?.("Local: http://127.0.0.1:3400/?token=fixture"));
+        return process;
+      },
+    );
+    await Promise.all([hub.stop(), hub.stop()]);
+    await hub.stop();
+    expect(signals).toEqual(ignoresTerm ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+  },
+);
+
+test.skipIf(process.platform === "win32")(
+  "process cleanup escalates a real child to SIGKILL",
+  async () => {
+    const ready = Promise.withResolvers<void>();
+    const child = spawnProcess({
+      command: process.execPath,
+      args: [
+        "--eval",
+        'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000);',
+      ],
+      onStdoutLine: () => ready.resolve(),
+    });
+    try {
+      await ready.promise;
+      await stopProcess(child, 10, 1000);
+      expect((await child.exited).signal).toBe("SIGKILL");
+    } finally {
+      child.stop("SIGKILL");
+    }
+  },
+);
+
+test("hub startup rollback awaits bounded forced termination", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    startHub(
+      {
+        externalNode: "fixture-node",
+        hubCli: "fixture-hub",
+        platform: "android",
+        deviceId: "fixture-device",
+        readyTimeoutMs: 5,
+        stopGraceMs: 5,
+        stopKillMs: 5,
+      },
+      () => ({
+        pid: undefined,
+        exited: exited.promise,
+        stop: (signal = "SIGTERM") => {
+          signals.push(signal);
+          if (signal === "SIGKILL") exited.resolve({ code: null, signal });
+        },
+      }),
+    ),
+  ).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+});
+
+test("unobserved process exit releases resources and reports a bounded timeout", async () => {
+  const signals: NodeJS.Signals[] = [];
+  let released = false;
+  const process: LongRunningProcess = {
+    pid: undefined,
+    exited: new Promise(() => undefined),
+    stop: (signal = "SIGTERM") => {
+      signals.push(signal);
+    },
+    release: () => {
+      released = true;
+    },
+  };
+  const stopping = stopProcess(process, 5, 5);
+  expect(stopProcess(process, 5, 5)).toBe(stopping);
+  await expect(stopping).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  expect(released).toBe(true);
 });
 
 test("appendBounded keeps the newest bytes once the cap is reached", () => {

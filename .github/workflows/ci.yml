@@ -28,6 +28,7 @@ jobs:
       approved: ${{ steps.approval.outputs.approved }}
       ref: ${{ steps.approval.outputs.ref }}
       head: ${{ steps.approval.outputs.head }}
+      base: ${{ steps.approval.outputs.base }}
       number: ${{ steps.approval.outputs.number }}
     steps:
       - uses: actions/github-script@v7
@@ -62,6 +63,7 @@ jobs:
             });
             if (pull.state !== 'open' || pull.draft || pull.base.ref !== 'main' ||
                 pull.head.sha !== match[2]) return;
+            await pending(pull.head.sha);
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               ...repository, pull_number: number, per_page: 100,
             });
@@ -70,7 +72,6 @@ jobs:
               ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state));
             const latest = decisions.sort((left, right) => left.id - right.id).at(-1);
             if (latest?.state !== 'APPROVED' || latest.commit_id !== pull.head.sha) return;
-            await pending(pull.head.sha);
             if (!pull.merge_commit_sha) {
               core.setFailed('No merge commit is available. Resolve conflicts and approve again.');
               return;
@@ -78,6 +79,7 @@ jobs:
             core.setOutput('approved', 'true');
             core.setOutput('ref', pull.merge_commit_sha);
             core.setOutput('head', pull.head.sha);
+            core.setOutput('base', pull.base.sha);
             core.setOutput('number', number);
 
   validate-pr:
@@ -103,6 +105,7 @@ jobs:
         env:
           PR_NUMBER: ${{ needs.approval.outputs.number }}
           PR_HEAD: ${{ needs.approval.outputs.head }}
+          PR_BASE: ${{ needs.approval.outputs.base }}
           VALIDATION_RESULT: ${{ needs.validate-pr.result }}
         with:
           script: |
@@ -119,12 +122,16 @@ jobs:
               ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state))
               .sort((left, right) => left.id - right.id).at(-1);
             const approved = latest?.state === 'APPROVED' && latest.commit_id === pull.head.sha;
-            const success = approved && process.env.VALIDATION_RESULT === 'success';
+            const current = !pull.draft && pull.base.ref === 'main' &&
+              pull.base.sha === process.env.PR_BASE;
+            const success = approved && current && process.env.VALIDATION_RESULT === 'success';
             await github.rest.repos.createCommitStatus({
               ...repository, sha: process.env.PR_HEAD, context: 'Release checks',
               state: success ? 'success' : 'failure',
               description: success ? 'Owner-approved release validation passed.' :
-                approved ? 'Release validation failed or was cancelled.' : 'Owner approval is no longer valid.',
+                !approved ? 'Owner approval is no longer valid.' :
+                !current ? 'The merge candidate changed. Approve again to validate it.' :
+                'Release validation failed or was cancelled.',
               target_url: `${context.serverUrl}/${repository.owner}/${repository.repo}/actions/runs/${context.runId}`,
             });
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -51,9 +51,20 @@ try {
       (await readFile(join(dir, ".helper-lock.sha256"), "utf8")).trim(),
       HELPER_LOCK_HASH,
     );
-    const native = createRequire(join(dir, "package.json"))("node-datachannel");
-    assert.equal(typeof native.PeerConnection, "function", "The host native module must load.");
-    native.cleanup?.();
+    execFileSync(
+      process.execPath,
+      [
+        "--input-type=commonjs",
+        "--eval",
+        `
+      const assert = require("node:assert/strict");
+      const native = require("node-datachannel");
+      assert.equal(typeof native.PeerConnection, "function", "The host native module must load.");
+      native.cleanup?.();
+    `,
+      ],
+      { cwd: dir, stdio: "inherit" },
+    );
     const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
     const previousPath = process.env[pathKey];
     process.env[pathKey] = join(temporary, "missing-toolchain");

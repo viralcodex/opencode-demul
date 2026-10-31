@@ -23,7 +23,7 @@ Add this entry to your OpenCode configuration.
 
 ```json
 {
-  "plugins": ["github:viralcodex/opencode-demul#v0.1.0"]
+  "plugins": ["github:viralcodex/opencode-demul#v0.1.1"]
 }
 ```
 
@@ -57,7 +57,7 @@ Use Bun 1.3.6 and a supported Node version to build and test it.
 ```sh
 bun install --frozen-lockfile
 bun run check
-bun run build
+bun run bundle
 bun run verify:package
 ```
 

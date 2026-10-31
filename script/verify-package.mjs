@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,13 @@ const root = process.env.DEMULE_PACKAGE_ROOT
   ? resolve(process.env.DEMULE_PACKAGE_ROOT)
   : dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+assert(!manifest.workspaces, "GitHub installs must not require workspace preparation.");
+for (const script of ["postinstall", "build", "preinstall", "install", "prepack", "prepare"]) {
+  assert(
+    !manifest.scripts?.[script],
+    `GitHub installs must use prebuilt bundles, not the ${script} script. Run release:check explicitly.`,
+  );
+}
 const temporary = await mkdtemp(join(tmpdir(), "demule-package-"));
 const run = (command, args, cwd = root) => {
   if (command === "npm" && process.platform === "win32") {
@@ -64,12 +71,10 @@ try {
     join(temporary, packed.filename),
   ]);
   const installed = join(temporary, "node_modules", manifest.name);
-  const output = run(
-    process.execPath,
-    [
-      "--experimental-default-type=module",
-      "-e",
-      String.raw`
+  const verification = join(installed, "verify-installed.mjs");
+  await writeFile(
+    verification,
+    String.raw`
         import assert from "node:assert/strict";
         import { readFile } from "node:fs/promises";
         import { createRequire, isBuiltin } from "node:module";
@@ -122,9 +127,8 @@ try {
         for (const cleanup of cleanups) await cleanup();
         console.log("OpenCode resolves the installed server and GUI; main IPC setup and cleanup pass.");
       `,
-    ],
-    installed,
   );
+  const output = run(process.execPath, [verification], installed);
   console.log(output.trim());
   console.log(`Verified ${manifest.name}@${manifest.version}: ${files.length} release files.`);
 } finally {

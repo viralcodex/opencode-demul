@@ -30,7 +30,10 @@ import {
   parseNodeVersion,
   resolveExternalNode,
   satisfiesNode,
+  HELPER_LOCK_HASH,
 } from "./helpers.js";
+import helperPackage from "./helper-package.json" with { type: "json" };
+import helperLock from "./helper-lock.json" with { type: "json" };
 import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
 import { readPngDimensions } from "./png.js";
 import { appendBounded } from "./process.js";
@@ -148,6 +151,26 @@ test.skipIf(process.platform === "win32")(
   },
 );
 
+test("helper lock pins roots and includes every native optional platform", () => {
+  expect(helperLock.lockfileVersion).toBe(3);
+  expect(helperLock.packages[""].dependencies).toEqual(helperPackage.dependencies);
+  expect(helperLock.packages["node_modules/agent-device"].version).toBe(
+    helperPackage.dependencies["agent-device"],
+  );
+  expect(helperLock.packages["node_modules/expo-device-hub"].version).toBe(
+    helperPackage.dependencies["expo-device-hub"],
+  );
+  const packages: Record<string, { version?: string; resolved?: string; integrity?: string }> =
+    helperLock.packages;
+  for (const [name, version] of Object.entries(
+    helperLock.packages["node_modules/node-datachannel"].optionalDependencies,
+  )) {
+    expect(packages[`node_modules/${name}`]?.version).toBe(version);
+    expect(packages[`node_modules/${name}`]?.integrity).toMatch(/^sha512-/u);
+  }
+  expect(HELPER_LOCK_HASH).toMatch(/^[a-f0-9]{64}$/u);
+});
+
 test("Windows helper installation uses Node and npm CLI without a shell", () => {
   const node = "C:\\Program Files\\nodejs\\node.exe";
   const cli = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
@@ -161,8 +184,9 @@ test("Windows helper installation uses Node and npm CLI without a shell", () => 
   expect(invocation.command).toBe(node);
   expect(invocation.args[0]).toBe(cli);
   expect(invocation.args).toContain("C:\\Device Helpers");
-  expect(invocation.args).toContain("--no-save");
-  expect(invocation.args).toContain("--no-package-lock");
+  expect(invocation.args).toContain("ci");
+  expect(invocation.args).toContain("--include=optional");
+  expect(invocation.args).not.toContain("--no-package-lock");
 });
 
 test("manual gestures use authenticated device-scoped routes and report rejection", async () => {

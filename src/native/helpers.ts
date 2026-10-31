@@ -1,17 +1,23 @@
-import { readFile, access, mkdir, readdir, writeFile } from "node:fs/promises";
+import { readFile, access, mkdir, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { Option, Schema } from "effect";
 import { deviceError } from "./errors.js";
 import { parseJson } from "./json.js";
 import { runCommand } from "./process.js";
+import helperPackage from "./helper-package.json" with { type: "json" };
+import helperLock from "./helper-lock.json" with { type: "json" };
 
 // The helper installation and external-runtime resolution. The two automation helpers run under an external Node, not
 // Electron's embedded one, and install into an isolated, caller-owned directory with exact pins, so the repository's
 // lockfile never churns. Nothing here upgrades system tooling; it installs only these two npm packages on request.
 
 // The exact helper versions, pinned after verifying their npm metadata, source, and MIT licensing.
-export const PINS = { "agent-device": "0.21.35", "expo-device-hub": "0.19.0" } as const;
+export const PINS = helperPackage.dependencies;
+export const HELPER_LOCK_HASH = createHash("sha256")
+  .update(JSON.stringify(helperLock))
+  .digest("hex");
 
 export const MIN_NODE = { major: 22, minor: 19 };
 
@@ -44,16 +50,13 @@ export function installArgs(
     command: npmCli ? (node ?? "node") : "npm",
     args: [
       ...(npmCli ? [npmCli] : []),
-      "install",
+      "ci",
       "--prefix",
       dir,
-      "--no-save",
-      "--no-package-lock",
       "--no-audit",
       "--no-fund",
       "--omit=dev",
-      `agent-device@${PINS["agent-device"]}`,
-      `expo-device-hub@${PINS["expo-device-hub"]}`,
+      "--include=optional",
     ],
   };
 }
@@ -65,18 +68,20 @@ export async function ensureHelpers(
   timeoutMs = 300_000,
   node = "node",
 ): Promise<HelperPaths> {
-  const existing = await resolveHelperPaths(dir);
+  await mkdir(dir, { recursive: true });
+  const stamp = join(dir, ".helper-lock.sha256");
+  const previousHash = await readFile(stamp, "utf8").catch(() => null);
+  const existing = previousHash?.trim() === HELPER_LOCK_HASH ? await resolveHelperPaths(dir) : null;
   if (existing) return existing;
 
-  await mkdir(dir, { recursive: true });
+  await rm(stamp, { force: true });
   // A manifest lets `npm --prefix` treat the directory as its own project, so the install stays local to it.
-  await writeFile(
-    join(dir, "package.json"),
-    `${JSON.stringify({ name: "opencode-device-helpers", private: true, version: "0.0.0" }, null, 2)}\n`,
-  );
+  await writeFile(join(dir, "package.json"), `${JSON.stringify(helperPackage, null, 2)}\n`);
+  await writeFile(join(dir, "package-lock.json"), `${JSON.stringify(helperLock, null, 2)}\n`);
   const npmCli = process.platform === "win32" ? await resolveNpmCli(node) : undefined;
-  const { command, args } = installArgs(dir, node, npmCli);
-  const result = await runCommand({ command, args, timeoutMs, cwd: dir });
+  const projectDir = await realpath(dir);
+  const { command, args } = installArgs(projectDir, node, npmCli);
+  const result = await runCommand({ command, args, timeoutMs, cwd: projectDir });
   if (result.code !== 0) {
     const reason =
       result.spawnError ??
@@ -93,6 +98,7 @@ export async function ensureHelpers(
       "missing-prerequisite",
       "The device helpers installed but their CLIs are missing.",
     );
+  await writeFile(stamp, `${HELPER_LOCK_HASH}\n`);
   return resolved;
 }
 

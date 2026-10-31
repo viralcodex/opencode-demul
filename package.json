@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@opencode/plugin-device",
+  "version": "0.1.0",
+  "description": "Local Android emulator viewing and session-bound automation for OpenCode Desktop on Windows, Linux, and macOS",
+  "keywords": [
+    "android",
+    "desktop",
+    "emulator",
+    "opencode",
+    "opencode-plugin"
+  ],
+  "homepage": "https://github.com/viralcodex/opencode-demul#readme",
+  "bugs": {
+    "url": "https://github.com/viralcodex/opencode-demul/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/viralcodex/opencode-demul.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./dist/server.js",
+    "./server": "./dist/server.js",
+    "./gui-experimental": "./dist/gui.cjs"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.2",
+    "@opencode/schema": "2.2.2",
+    "effect": "4.0.6",
+    "ws": "8.22.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}

@@ -212,16 +212,6 @@ export default Plugin.define({
         if (!value) setSelectedDevice(attachment() ? previous : "");
       };
 
-      const detach = async () => {
-        const current = attachment();
-        if (!current) return;
-        const closed = await outcome("close", () =>
-          bridge.manual({ scope: scope(), operation: { type: "close", handle: current.handle } }),
-        );
-        if (!closed) return;
-        setSelectedDevice("");
-      };
-
       createEffect(() => {
         scope();
         void refresh();
@@ -384,17 +374,6 @@ export default Plugin.define({
                 {(device) => <option value={device.id}>{device.name}</option>}
               </For>
             </select>
-            <ctx.ui.Tooltip value="Detach device">
-              <button
-                type="button"
-                class="device-panel__action"
-                aria-label="Detach device"
-                disabled={!attachment() || !!busy()}
-                onClick={() => void detach()}
-              >
-                <ctx.ui.Icon name="close" size="small" />
-              </button>
-            </ctx.ui.Tooltip>
             <ctx.ui.Tooltip
               value={
                 attachment()?.agentAccess

@@ -150,10 +150,13 @@ export function spawnProcess(spec: SpawnSpec): LongRunningProcess {
     env: spec.env ? { ...process.env, ...spec.env } : process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  lineReader(child.stdout, spec.onStdoutLine);
-  lineReader(child.stderr, spec.onStderrLine);
+  lineReader(child.stdout, spec.onStdoutLine, spec.maxBytes);
+  lineReader(child.stderr, spec.onStderrLine, spec.maxBytes);
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.on("error", () => resolve({ code: null, signal: null }));
+    child.on("error", (error) => {
+      spec.onStderrLine?.(error.message);
+      resolve({ code: null, signal: null });
+    });
     child.on("close", (code, signal) => resolve({ code, signal }));
   });
   return {
@@ -171,17 +174,22 @@ export function spawnProcess(spec: SpawnSpec): LongRunningProcess {
 }
 
 // Split a readable stream into trimmed lines and forward each to `onLine`, keeping a partial trailing line buffered.
-function lineReader(stream: NodeJS.ReadableStream | null, onLine?: (line: string) => void) {
+function lineReader(
+  stream: NodeJS.ReadableStream | null,
+  onLine?: (line: string) => void,
+  maxBytes = DEFAULT_MAX_BYTES,
+) {
   if (!stream || !onLine) return;
   let buffer = "";
   stream.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
     let index = buffer.indexOf("\n");
     while (index !== -1) {
-      onLine(buffer.slice(0, index).replace(/\r$/u, ""));
+      onLine(appendBounded("", buffer.slice(0, index).replace(/\r$/u, ""), maxBytes));
       buffer = buffer.slice(index + 1);
       index = buffer.indexOf("\n");
     }
+    buffer = appendBounded("", buffer, maxBytes);
   });
   stream.on("close", () => {
     if (buffer.length > 0) onLine(buffer.replace(/\r$/u, ""));

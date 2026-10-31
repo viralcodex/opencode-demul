@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -151,9 +151,14 @@ test.skipIf(process.platform === "win32")(
   },
 );
 
-test.skipIf(process.platform === "win32").each([false, true])(
-  "POSIX helper installation uses selected Node with restricted PATH, NVM=%s",
-  async (nvm) => {
+test.skipIf(process.platform === "win32").each([
+  { nvm: false, symlinked: false },
+  { nvm: true, symlinked: false },
+  { nvm: false, symlinked: true },
+  { nvm: true, symlinked: true },
+])(
+  "POSIX helper installation uses selected Node with restricted PATH: %j",
+  async ({ nvm, symlinked }) => {
     const directory = await mkdtemp(join(tmpdir(), "device-node-toolchain-"));
     const saved = {
       PATH: process.env["PATH"],
@@ -164,9 +169,10 @@ test.skipIf(process.platform === "win32").each([false, true])(
     try {
       const prefix = join(directory, "versions", "node", "v24.1.0");
       const node = join(prefix, "bin", "node");
-      const cli = join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+      const npmRoot = symlinked ? join(prefix, "libexec", "lib") : join(prefix, "lib");
+      const cli = join(npmRoot, "node_modules", "npm", "bin", "npm-cli.js");
       await mkdir(join(prefix, "bin"), { recursive: true });
-      await mkdir(join(prefix, "lib", "node_modules", "npm", "bin"), { recursive: true });
+      await mkdir(join(npmRoot, "node_modules", "npm", "bin"), { recursive: true });
       await writeFile(
         node,
         `#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'v24.1.0\\n'; elif [ "$1" = "--print" ]; then printf '%s\\n' "$0"; else exec '${process.execPath}' "$@"; fi\n`,
@@ -180,9 +186,10 @@ test.skipIf(process.platform === "win32").each([false, true])(
       process.env["NVM_DIR"] = directory;
       delete process.env["OPENCODE_DEVICE_NODE"];
       process.env["npm_execpath"] = join(directory, "unrelated", "npm-cli.js");
+      if (symlinked) await symlink(cli, join(prefix, "bin", "npm"));
       const selected = await resolveExternalNode(nvm ? undefined : node);
       expect(selected).toBe(node);
-      expect(await resolveNpmCli(selected)).toBe(cli);
+      expect(await resolveNpmCli(selected)).toBe(symlinked ? await realpath(cli) : cli);
       const paths = await ensureHelpers(join(directory, "helpers"), 10_000, selected);
       expect(paths.agentDeviceBin).toBe(
         join(directory, "helpers", "node_modules", "agent-device", "cli.js"),

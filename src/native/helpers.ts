@@ -1,4 +1,4 @@
-import { readFile, access, mkdir, readdir, writeFile } from "node:fs/promises";
+import { readFile, access, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { Option, Schema } from "effect";
@@ -204,7 +204,12 @@ export function npmCliCandidates(
 }
 
 export async function resolveNpmCli(node: string): Promise<string> {
-  for (const candidate of npmCliCandidates(node)) {
+  const adjacent =
+    process.platform === "win32"
+      ? undefined
+      : await realpath(join(posix.dirname(node), "npm")).catch(() => undefined);
+  const candidates = [...(adjacent ? [adjacent] : []), ...npmCliCandidates(node)];
+  for (const candidate of candidates) {
     if (!(await exists(candidate))) continue;
     const result = await runCommand({
       command: node,

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect } from "node:net";
 import {
   appsArgs,
   capabilitiesArgs,
@@ -35,7 +36,12 @@ import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } fro
 import { readPngDimensions } from "./png.js";
 import { appendBounded } from "./process.js";
 import { createNativeRuntime } from "./runtime.js";
-import { androidHelperEnv, androidToolPath, resolveAndroidSdkRoot } from "./android.js";
+import {
+  androidHelperEnv,
+  androidToolPath,
+  ensureBooted,
+  resolveAndroidSdkRoot,
+} from "./android.js";
 import { Schema } from "effect";
 import { Device } from "../rpc.js";
 
@@ -55,6 +61,124 @@ test("missing Android SDK tools report a prerequisite error rather than an empty
   await expect(
     androidDevices({ androidSdkRoot: "/missing/device-test-sdk" }),
   ).rejects.toMatchObject({ data: { code: "missing-prerequisite" } });
+});
+
+test.each([1, null])("Android startup reports immediate child failure, code=%s", async (code) => {
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+      run: async () => ({
+        code: 0,
+        signal: null,
+        stdout: "List of devices attached\n",
+        stderr: "",
+        timedOut: false,
+      }),
+      spawn: (spec) => {
+        spec.onStderrLine?.(`${"x".repeat(8_000)}missing fixture image`);
+        return {
+          pid: undefined,
+          exited: Promise.resolve({ code, signal: null }),
+          stop: (signal = "SIGTERM") => {
+            signals.push(signal);
+          },
+        };
+      },
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "helper-failed", message: expect.stringContaining("missing fixture image") },
+  });
+  expect(signals).toEqual(["SIGKILL"]);
+});
+
+test("Android cold boot uses only the serial reported by its own child", async () => {
+  let spawned = false;
+  const commands: string[][] = [];
+  const child = {
+    pid: undefined,
+    exited: new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(() => undefined),
+    stop: () => undefined,
+  };
+  const booted = await ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+    run: async (spec) => {
+      commands.push([...spec.args]);
+      const stdout =
+        spec.args[0] === "devices"
+          ? `List of devices attached\n${spawned ? "emulator-5554\tdevice\nemulator-5556\tdevice\n" : ""}`
+          : spec.args.includes("getprop")
+            ? "1\n"
+            : "fixture-avd\nOK\n";
+      return { code: 0, signal: null, stdout, stderr: "", timedOut: false };
+    },
+    spawn: (spec) => {
+      spawned = true;
+      const report = spec.args[spec.args.indexOf("-report-console") + 1]!;
+      const port = Number(report.match(/^tcp:(\d+)/u)?.[1]);
+      const socket = connect(port, "127.0.0.1", () => socket.end("5556"));
+      return child;
+    },
+    pollIntervalMs: 5,
+  });
+  expect(booted).toEqual({ serial: "emulator-5556", bootedByUs: true, process: child });
+  expect(commands.some((args) => args.includes("emulator-5554"))).toBe(false);
+});
+
+test("Android startup detects child exit while waiting for boot completion", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  let spawned = false;
+  await expect(
+    ensureBooted({ timeoutMs: 500 }, "fixture-avd", true, {
+      run: async (spec) => {
+        if (spec.args.includes("getprop")) exited.resolve({ code: 1, signal: null });
+        const stdout =
+          spec.args[0] === "devices"
+            ? `List of devices attached\n${spawned ? "emulator-5556\tdevice\n" : ""}`
+            : spec.args.includes("getprop")
+              ? "0\n"
+              : "fixture-avd\nOK\n";
+        return { code: 0, signal: null, stdout, stderr: "", timedOut: false };
+      },
+      spawn: (spec) => {
+        spawned = true;
+        const report = spec.args[spec.args.indexOf("-report-console") + 1]!;
+        const socket = connect(Number(report.match(/^tcp:(\d+)/u)?.[1]), "127.0.0.1", () =>
+          socket.end("5556"),
+        );
+        spec.onStderrLine?.("fixture boot crash");
+        return { pid: undefined, exited: exited.promise, stop: () => undefined };
+      },
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "helper-failed", message: expect.stringContaining("fixture boot crash") },
+  });
+});
+
+test("Android boot timeout awaits termination of its spawned child", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    ensureBooted({ timeoutMs: 10 }, "fixture-avd", true, {
+      run: async () => ({
+        code: 0,
+        signal: null,
+        stdout: "List of devices attached\n",
+        stderr: "",
+        timedOut: false,
+      }),
+      spawn: () => ({
+        pid: undefined,
+        exited: exited.promise,
+        stop: (signal = "SIGTERM") => {
+          signals.push(signal);
+          exited.resolve({ code: null, signal });
+        },
+      }),
+      pollIntervalMs: 5,
+    }),
+  ).rejects.toMatchObject({ data: { code: "timeout" } });
+  expect(signals).toEqual(["SIGKILL"]);
 });
 
 test("Android SDK defaults and executable paths cover every desktop OS", () => {

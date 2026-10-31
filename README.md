@@ -42,12 +42,22 @@ shutting down an emulator requires a separate permission prompt.
 Tools use `device_*` names, or `device.*` in Code Mode. They can inspect the
 screen, launch apps, enter text, interact with elements and take screenshots.
 
-Android emulators only. iOS, physical devices, remote servers and direct keyboard
-typing into the panel are not supported. Windows and Linux live testing is still
-pending.
+Android emulators only (for now).
+[iOS, physical devices, remote servers and direct keyboard input into the panel coming soon.]
 
-The repository contains prebuilt plugin files. No build step or Bun installation
-is needed to install the plugin.
+Prebuilt plugin files are included. No build step or Bun installation is needed
+to install the plugin.
+
+## Development
+
+Use Bun 1.3.6 and a supported Node version to build and test it.
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run build
+bun run verify:package
+```
 
 MIT license. Dependency licenses are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

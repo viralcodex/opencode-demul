@@ -1,0 +1,11 @@
+node_modules/
+.vscode/
+.idea/
+coverage/
+/script/stage-release.mjs
+*.tgz
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example

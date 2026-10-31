@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+  workflow_run:
+    workflows: [PR approval]
+    types: [completed]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  approval:
+    name: Verify owner approval
+    if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+      ref: ${{ steps.approval.outputs.ref }}
+      head: ${{ steps.approval.outputs.head }}
+      base: ${{ steps.approval.outputs.base }}
+      number: ${{ steps.approval.outputs.number }}
+    steps:
+      - uses: actions/github-script@v7
+        id: approval
+        with:
+          script: |
+            const repository = context.repo;
+            const targetUrl = `${context.serverUrl}/${repository.owner}/${repository.repo}/actions/runs/${context.runId}`;
+            const pending = async sha => github.rest.repos.createCommitStatus({
+              ...repository, sha, context: 'Release checks', state: 'pending',
+              description: 'Waiting for repository owner approval and release validation.',
+              target_url: targetUrl,
+            });
+            core.setOutput('approved', 'false');
+            if (context.eventName === 'pull_request_target') {
+              const eventPull = context.payload.pull_request;
+              const { data: current } = await github.rest.pulls.get({
+                ...repository, pull_number: eventPull.number,
+              });
+              if (current.state === 'open' && current.head.sha === eventPull.head.sha) {
+                await pending(current.head.sha);
+              }
+              return;
+            }
+            const run = context.payload.workflow_run;
+            if (run.event !== 'pull_request_review' || run.conclusion !== 'success') return;
+            const match = /^Approve PR #(\d+) at ([a-f0-9]{40})$/.exec(run.display_title);
+            if (!match) return;
+            const number = Number(match[1]);
+            const { data: pull } = await github.rest.pulls.get({
+              ...repository, pull_number: number,
+            });
+            if (pull.state !== 'open' || pull.draft || pull.base.ref !== 'main' ||
+                pull.head.sha !== match[2]) return;
+            await pending(pull.head.sha);
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              ...repository, pull_number: number, per_page: 100,
+            });
+            const decisions = reviews.filter(review =>
+              review.user?.login.toLowerCase() === repository.owner.toLowerCase() &&
+              ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state));
+            const latest = decisions.sort((left, right) => left.id - right.id).at(-1);
+            if (latest?.state !== 'APPROVED' || latest.commit_id !== pull.head.sha) return;
+            if (!pull.merge_commit_sha) {
+              core.setFailed('No merge commit is available. Resolve conflicts and approve again.');
+              return;
+            }
+            core.setOutput('approved', 'true');
+            core.setOutput('ref', pull.merge_commit_sha);
+            core.setOutput('head', pull.head.sha);
+            core.setOutput('base', pull.base.sha);
+            core.setOutput('number', number);
+
+  validate-pr:
+    needs: approval
+    if: needs.approval.outputs.approved == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.approval.outputs.ref }}
+    permissions:
+      contents: read
+
+  report-pr:
+    name: Report PR result
+    needs: [approval, validate-pr]
+    if: always() && needs.approval.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.approval.outputs.number }}
+          PR_HEAD: ${{ needs.approval.outputs.head }}
+          PR_BASE: ${{ needs.approval.outputs.base }}
+          VALIDATION_RESULT: ${{ needs.validate-pr.result }}
+        with:
+          script: |
+            const repository = context.repo;
+            const { data: pull } = await github.rest.pulls.get({
+              ...repository, pull_number: Number(process.env.PR_NUMBER),
+            });
+            if (pull.state !== 'open' || pull.head.sha !== process.env.PR_HEAD) return;
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              ...repository, pull_number: pull.number, per_page: 100,
+            });
+            const latest = reviews.filter(review =>
+              review.user?.login.toLowerCase() === repository.owner.toLowerCase() &&
+              ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state))
+              .sort((left, right) => left.id - right.id).at(-1);
+            const approved = latest?.state === 'APPROVED' && latest.commit_id === pull.head.sha;
+            const current = !pull.draft && pull.base.ref === 'main' &&
+              pull.base.sha === process.env.PR_BASE;
+            const success = approved && current && process.env.VALIDATION_RESULT === 'success';
+            await github.rest.repos.createCommitStatus({
+              ...repository, sha: process.env.PR_HEAD, context: 'Release checks',
+              state: success ? 'success' : 'failure',
+              description: success ? 'Owner-approved release validation passed.' :
+                !approved ? 'Owner approval is no longer valid.' :
+                !current ? 'The merge candidate changed. Approve again to validate it.' :
+                'Release validation failed or was cancelled.',
+              target_url: `${context.serverUrl}/${repository.owner}/${repository.repo}/actions/runs/${context.runId}`,
+            });
+
+  validate-main:
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ github.sha }}
+    permissions:
+      contents: read
+
+  release-checks:
+    name: Release checks
+    needs: validate-main
+    if: always() && github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULT: ${{ needs.validate-main.result }}
+        run: test "$RESULT" = success

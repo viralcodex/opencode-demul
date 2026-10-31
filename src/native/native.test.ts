@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,11 @@ import {
   parseNodeVersion,
   resolveExternalNode,
   satisfiesNode,
+  defaultHelperDir,
+  ensureHelpers,
+  PINS,
+  resolveHelperPaths,
+  validateHelperDirectory,
 } from "./helpers.js";
 import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
 import { readPngDimensions } from "./png.js";
@@ -142,6 +147,60 @@ test.skipIf(process.platform === "win32")(
       expect(process.env["PATH"]).toBe(originalPath);
       expect(process.env["ANDROID_HOME"]).toBe(originalHome);
       expect(process.env["ANDROID_SDK_ROOT"]).toBe(originalRoot);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(process.platform === "win32")(
+  "helper caches reject unsafe ownership, permissions, symlinks and escaped bins",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "device-cache-"));
+    const root = join(directory, "helpers");
+    try {
+      expect(defaultHelperDir("/home/test")).toBe("/home/test/.cache/opencode/device-helpers");
+      await mkdir(root, { mode: 0o700 });
+      await expect(
+        validateHelperDirectory(root, (process.getuid?.() ?? 0) + 1),
+      ).rejects.toMatchObject({ data: { code: "missing-prerequisite" } });
+      await chmod(root, 0o777);
+      await expect(ensureHelpers(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await chmod(root, 0o700);
+      const linked = join(directory, "linked");
+      await symlink(root, linked);
+      await expect(ensureHelpers(linked)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      for (const pkg of Object.keys(PINS) as (keyof typeof PINS)[]) {
+        const packageRoot = join(root, "node_modules", pkg);
+        await mkdir(packageRoot, { recursive: true });
+        await writeFile(
+          join(packageRoot, "package.json"),
+          JSON.stringify({ version: PINS[pkg], bin: "cli.js" }),
+        );
+        await writeFile(join(packageRoot, "cli.js"), "");
+      }
+      expect(await resolveHelperPaths(root)).not.toBeNull();
+      const packageRoot = join(root, "node_modules", "agent-device");
+      await writeFile(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ version: PINS["agent-device"], bin: "../../../outside.js" }),
+      );
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+      await writeFile(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ version: PINS["agent-device"], bin: "cli.js" }),
+      );
+      await rm(join(packageRoot, "cli.js"));
+      await symlink(join(packageRoot, "package.json"), join(packageRoot, "cli.js"));
+      await expect(resolveHelperPaths(root)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

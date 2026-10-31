@@ -19,9 +19,18 @@ export async function sendGesture(
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
-  const result = parseJson(Schema.Struct({ ok: Schema.Boolean }), await response.text());
+  const result = parseJson(
+    Schema.Struct({ ok: Schema.Boolean, error: Schema.optionalKey(Schema.String) }),
+    await response.text(),
+  );
   if (!response.ok || Option.isNone(result) || !result.value.ok) {
-    throw deviceError("helper-failed", `The device rejected the ${gesture.type} gesture.`, true);
+    const detail = Option.isSome(result) ? result.value.error?.trim() : undefined;
+    const safeDetail = detail?.replaceAll(stream.token, "[redacted]").slice(0, 512);
+    throw deviceError(
+      "helper-failed",
+      `The device rejected the ${gesture.type} gesture (HTTP ${response.status})${safeDetail ? `: ${safeDetail}` : "."}`,
+      true,
+    );
   }
 }
 

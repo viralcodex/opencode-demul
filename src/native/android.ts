@@ -55,6 +55,28 @@ export function androidToolPath(
   return paths.join(root, tool === "adb" ? "platform-tools" : "emulator", executable);
 }
 
+export function androidHelperEnv(
+  root?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> | undefined {
+  if (!root) return undefined;
+  const paths = platform === "win32" ? win32 : posix;
+  const pathKey =
+    platform === "win32"
+      ? (Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path")
+      : "PATH";
+  return {
+    ANDROID_HOME: root,
+    ANDROID_SDK_ROOT: root,
+    [pathKey]: [
+      paths.join(root, "platform-tools"),
+      paths.join(root, "emulator"),
+      ...(env[pathKey] ? [env[pathKey]] : []),
+    ].join(paths.delimiter),
+  };
+}
+
 // Find the adb serial of a running emulator whose reported AVD name matches, or null when none is running.
 export async function resolveRunningSerial(
   options: AndroidOptions,

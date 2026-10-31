@@ -2,6 +2,40 @@ import type { Device } from "./rpc.js";
 
 export type ViewerState = "idle" | "connecting" | "playing" | "paused";
 
+export interface ScreenFrame {
+  readonly token: string;
+  readonly width: number;
+  readonly height: number;
+}
+
+export function screenFrame(
+  token: string | undefined,
+  renderedToken: string | undefined,
+  state: ViewerState,
+  size: { width: number; height: number },
+): ScreenFrame | undefined {
+  if (
+    !token ||
+    token !== renderedToken ||
+    state !== "playing" ||
+    !Number.isSafeInteger(size.width) ||
+    !Number.isSafeInteger(size.height) ||
+    size.width <= 0 ||
+    size.height <= 0
+  )
+    return;
+  return { token, width: size.width, height: size.height };
+}
+
+export function sameScreenFrame(start: ScreenFrame, current: ScreenFrame | undefined): boolean {
+  return (
+    !!current &&
+    start.token === current.token &&
+    start.width === current.width &&
+    start.height === current.height
+  );
+}
+
 export interface ViewerOptions {
   readonly canvas: HTMLCanvasElement;
   readonly stream: Device.StreamDescriptor;
@@ -54,6 +88,8 @@ export function createViewer(options: ViewerOptions) {
       document.removeEventListener("visibilitychange", visibility);
       stop?.();
       stop = undefined;
+      options.canvas.width = 0;
+      options.canvas.height = 0;
       options.onState("idle");
     },
   };

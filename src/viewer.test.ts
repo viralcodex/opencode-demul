@@ -2,12 +2,69 @@ import { describe, expect, test } from "bun:test";
 import {
   annexBCodec,
   contentPoint,
+  createViewer,
   multipartBoundary,
   parseFramePacket,
   parseMjpegFrames,
+  sameScreenFrame,
+  screenFrame,
 } from "./viewer.js";
 
 const annexB = new Uint8Array([0, 0, 0, 1, 0x67, 0x64, 0, 0x29, 0, 0, 1, 0x65, 0x88]);
+
+test("destroying a viewer clears the previous device canvas dimensions", () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const listeners = new Set<EventListener>();
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      addEventListener: (_type: string, listener: EventListener) => listeners.add(listener),
+      removeEventListener: (_type: string, listener: EventListener) => listeners.delete(listener),
+    },
+  });
+  try {
+    const canvas = { width: 100, height: 200 } as HTMLCanvasElement;
+    const states: string[] = [];
+    const viewer = createViewer({
+      canvas,
+      stream: {
+        platform: "android",
+        deviceId: "device-a",
+        baseUrl: "http://127.0.0.1:3400",
+        token: "private",
+        protocol: "h264",
+        loopback: true,
+      },
+      onState: (state) => states.push(state),
+      onError: () => undefined,
+    });
+    expect(listeners.size).toBe(1);
+    viewer.destroy();
+    expect(canvas.width).toBe(0);
+    expect(canvas.height).toBe(0);
+    expect(states).toEqual(["idle"]);
+    expect(listeners.size).toBe(0);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "document", original);
+    else Reflect.deleteProperty(globalThis, "document");
+  }
+});
+
+test("screen input requires a current rendered frame and rejects a changed gesture target", () => {
+  const first = { token: "device-a", width: 100, height: 200 };
+  expect(screenFrame(first.token, first.token, "playing", first)).toEqual(first);
+  for (const state of ["idle", "connecting", "paused"] as const)
+    expect(screenFrame("device-b", undefined, state, first)).toBeUndefined();
+  expect(screenFrame("device-b", first.token, "playing", first)).toBeUndefined();
+  expect(screenFrame("device-b", undefined, "idle", { width: 0, height: 0 })).toBeUndefined();
+  const next = screenFrame("device-b", "device-b", "playing", { width: 200, height: 400 });
+  expect(next).toEqual({ token: "device-b", width: 200, height: 400 });
+  expect(sameScreenFrame(first, undefined)).toBe(false);
+  expect(sameScreenFrame(first, next)).toBe(false);
+  expect(sameScreenFrame(first, { ...first, width: 200 })).toBe(false);
+  expect(sameScreenFrame(first, { ...first, height: 400 })).toBe(false);
+  expect(sameScreenFrame(first, first)).toBe(true);
+});
 
 describe("parseFramePacket", () => {
   test("parses raw Annex-B and detects an IDR keyframe", () => {

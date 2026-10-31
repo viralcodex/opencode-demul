@@ -3,7 +3,14 @@ import { MenuItem, Panel, Plugin, usePanel } from "@opencode/plugin/gui";
 import { DeviceBridge } from "./bridge.js";
 import { DeviceIpc } from "./ipc.js";
 import { Device } from "./rpc.js";
-import { contentPoint, createViewer, type ViewerState } from "./viewer.js";
+import {
+  contentPoint,
+  createViewer,
+  sameScreenFrame,
+  screenFrame,
+  type ScreenFrame,
+  type ViewerState,
+} from "./viewer.js";
 // @ts-expect-error Vite owns CSS side-effect imports in the GUI bundle.
 import styles from "./gui.css?inline";
 
@@ -83,6 +90,7 @@ export default Plugin.define({
       const [error, setError] = createSignal<string>();
       const [connectionError, setConnectionError] = createSignal<string>();
       const [viewerState, setViewerState] = createSignal<ViewerState>("idle");
+      const [renderedToken, setRenderedToken] = createSignal<string>();
       const [viewer, setViewer] = createSignal<ReturnType<typeof createViewer>>();
       const [canvas, setCanvas] = createSignal<HTMLCanvasElement>();
       const scope = () => ({
@@ -111,7 +119,14 @@ export default Plugin.define({
           return "Almost done, preparing the screen...";
         }
       });
-      let pointerStart: Device.LogicalPoint | undefined;
+      let pointerStart:
+        | { point: Device.LogicalPoint; frame: ScreenFrame; pointerId: number }
+        | undefined;
+      const currentFrame = () => {
+        const surface = canvas();
+        if (!surface || busy() === "open" || busy() === "close") return;
+        return screenFrame(attachmentToken(), renderedToken(), viewerState(), surface);
+      };
 
       createEffect(() => {
         const key = scopeKey(scope());
@@ -216,7 +231,13 @@ export default Plugin.define({
         const token = attachmentToken();
         const surface = canvas();
         const current = untrack(attachment);
+        pointerStart = undefined;
+        setRenderedToken(undefined);
         setViewerState("idle");
+        if (surface) {
+          surface.width = 0;
+          surface.height = 0;
+        }
         if (
           !current ||
           current.handle.token !== token ||
@@ -238,7 +259,11 @@ export default Plugin.define({
                 createViewer({
                   canvas: surface,
                   stream: result.stream,
-                  onState: setViewerState,
+                  onState: (state) => {
+                    if (abort.signal.aborted || attachmentToken() !== token) return;
+                    setRenderedToken(state === "playing" ? token : undefined);
+                    setViewerState(state);
+                  },
                   onError: setError,
                 }),
               );
@@ -267,20 +292,33 @@ export default Plugin.define({
         });
       };
       const pointerDown = (event: PointerEvent) => {
-        if (event.button !== 0) return;
-        pointerStart = point(event);
+        pointerStart = undefined;
+        const frame = currentFrame();
+        if (event.button !== 0 || !frame) return;
+        const start = point(event);
         const surface = canvas();
-        if (!pointerStart || !surface) return;
+        if (!start || !surface) return;
+        pointerStart = { point: start, frame, pointerId: event.pointerId };
         surface.focus();
         surface.setPointerCapture(event.pointerId);
       };
       const pointerUp = (event: PointerEvent) => {
         const current = attachment();
-        const from = pointerStart;
+        const start = pointerStart;
+        const from = start?.point;
         const to = point(event);
         pointerStart = undefined;
         const surface = canvas();
-        if (!current || !from || !to || !surface) return;
+        if (
+          !current ||
+          !start ||
+          !from ||
+          !to ||
+          !surface ||
+          start.pointerId !== event.pointerId ||
+          !sameScreenFrame(start.frame, currentFrame())
+        )
+          return;
         const viewport = { width: surface.width, height: surface.height };
         const distance = Math.hypot(to.x - from.x, to.y - from.y);
         if (distance < 12) {
@@ -296,7 +334,7 @@ export default Plugin.define({
             <canvas
               ref={setCanvas}
               aria-label="Live device screen"
-              style={{ visibility: attachment() ? "visible" : "hidden" }}
+              style={{ visibility: currentFrame() ? "visible" : "hidden" }}
               tabIndex={0}
               onPointerDown={pointerDown}
               onPointerUp={pointerUp}

@@ -1,6 +1,6 @@
-import { readFile, access, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
+import { readFile, access, mkdir, readdir, realpath, writeFile, lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, posix, win32 } from "node:path";
+import { join, posix, win32, relative, isAbsolute, sep } from "node:path";
 import { Option, Schema } from "effect";
 import { deviceError } from "./errors.js";
 import { parseJson } from "./json.js";
@@ -14,6 +14,55 @@ import { runCommand } from "./process.js";
 export const PINS = { "agent-device": "0.21.35", "expo-device-hub": "0.19.0" } as const;
 
 export const MIN_NODE = { major: 22, minor: 19 };
+
+export function defaultHelperDir(home = homedir()): string {
+  return join(home, ".cache", "opencode", "device-helpers");
+}
+
+export async function validateHelperDirectory(
+  dir: string,
+  uid = process.getuid?.(),
+): Promise<void> {
+  const metadata = await lstat(dir);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (uid !== undefined && (metadata.uid !== uid || (metadata.mode & 0o077) !== 0))
+  ) {
+    throw deviceError(
+      "missing-prerequisite",
+      "The device helper cache must be a private, user-owned directory without symlinks.",
+    );
+  }
+}
+
+async function trustedPath(root: string, path: string): Promise<boolean> {
+  const child = relative(root, path);
+  if (!child || isAbsolute(child) || child.split(sep).includes(".."))
+    throw deviceError(
+      "missing-prerequisite",
+      "A device helper path escapes its package directory.",
+    );
+  let current = root;
+  for (const part of child.split(sep)) {
+    current = join(current, part);
+    const metadata = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!metadata) return false;
+    if (
+      metadata.isSymbolicLink() ||
+      (current === path ? !metadata.isFile() : !metadata.isDirectory()) ||
+      (process.getuid && (metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0))
+    )
+      throw deviceError(
+        "missing-prerequisite",
+        "A device helper path is symlinked or not owned securely by the current user.",
+      );
+  }
+  return true;
+}
 
 export function parseNodeVersion(output: string) {
   const match = output.match(/v?(\d+)\.(\d+)\.(\d+)/u);
@@ -65,10 +114,12 @@ export async function ensureHelpers(
   timeoutMs = 300_000,
   node = "node",
 ): Promise<HelperPaths> {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await validateHelperDirectory(dir);
   const existing = await resolveHelperPaths(dir);
   if (existing) return existing;
 
-  await mkdir(dir, { recursive: true });
+  await trustedPath(dir, join(dir, "package.json"));
   // A manifest lets `npm --prefix` treat the directory as its own project, so the install stays local to it.
   await writeFile(
     join(dir, "package.json"),
@@ -103,6 +154,7 @@ export async function ensureHelpers(
 
 // Resolve both helper CLI entry files from an existing install, or null when either is not installed.
 export async function resolveHelperPaths(dir: string): Promise<HelperPaths | null> {
+  await validateHelperDirectory(dir);
   const agentDeviceBin = await resolveBin(dir, "agent-device");
   const hubCli = await resolveBin(dir, "expo-device-hub");
   if (!agentDeviceBin || !hubCli) return null;
@@ -118,6 +170,7 @@ const BinManifest = Schema.Struct({
 // Read a package's installed `package.json` and return the absolute path of its named bin, or null when absent.
 async function resolveBin(dir: string, pkg: keyof typeof PINS): Promise<string | null> {
   const root = join(dir, "node_modules", pkg);
+  if (!(await trustedPath(dir, join(root, "package.json")))) return null;
   const raw = await readFile(join(root, "package.json"), "utf8").catch(() => null);
   if (raw === null) return null;
   const manifest = parseJson(BinManifest, raw);
@@ -127,7 +180,7 @@ async function resolveBin(dir: string, pkg: keyof typeof PINS): Promise<string |
     typeof bin === "string" ? bin : bin ? (bin[pkg] ?? Object.values(bin)[0]) : undefined;
   if (!relative) return null;
   const resolved = join(root, relative);
-  return (await exists(resolved)) ? resolved : null;
+  return (await trustedPath(root, resolved)) ? resolved : null;
 }
 
 // Resolve the external Node binary the helpers run under and verify it meets the automation engine's minimum. The

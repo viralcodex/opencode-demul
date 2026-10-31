@@ -74,9 +74,14 @@ export async function ensureHelpers(
     join(dir, "package.json"),
     `${JSON.stringify({ name: "opencode-device-helpers", private: true, version: "0.0.0" }, null, 2)}\n`,
   );
-  const npmCli = process.platform === "win32" ? await resolveNpmCli(node) : undefined;
+  const npmCli = await resolveNpmCli(node);
   const { command, args } = installArgs(dir, node, npmCli);
-  const result = await runCommand({ command, args, timeoutMs, cwd: dir });
+  const paths = process.platform === "win32" ? win32 : posix;
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  const env = {
+    [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter),
+  };
+  const result = await runCommand({ command, args, timeoutMs, cwd: dir, env });
   if (result.code !== 0) {
     const reason =
       result.spawnError ??
@@ -186,11 +191,11 @@ export function npmCliCandidates(
   const paths = platform === "win32" ? win32 : posix;
   const pathValue = Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
   return [
+    paths.join(paths.dirname(node), "node_modules", "npm", "bin", "npm-cli.js"),
+    paths.join(paths.dirname(node), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     ...(env["npm_execpath"] && paths.basename(env["npm_execpath"]) === "npm-cli.js"
       ? [env["npm_execpath"]]
       : []),
-    paths.join(paths.dirname(node), "node_modules", "npm", "bin", "npm-cli.js"),
-    paths.join(paths.dirname(node), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     ...pathValue
       .split(platform === "win32" ? ";" : ":")
       .filter(Boolean)
@@ -198,9 +203,16 @@ export function npmCliCandidates(
   ];
 }
 
-async function resolveNpmCli(node: string): Promise<string> {
+export async function resolveNpmCli(node: string): Promise<string> {
   for (const candidate of npmCliCandidates(node)) {
-    if (await exists(candidate)) return candidate;
+    if (!(await exists(candidate))) continue;
+    const result = await runCommand({
+      command: node,
+      args: [candidate, "--version"],
+      timeoutMs: 10_000,
+    });
+    if (result.code === 0 && !result.timedOut && !result.signal && parseNodeVersion(result.stdout))
+      return candidate;
   }
   throw deviceError(
     "missing-prerequisite",

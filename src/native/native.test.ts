@@ -30,6 +30,9 @@ import {
   parseNodeVersion,
   resolveExternalNode,
   satisfiesNode,
+  ensureHelpers,
+  PINS,
+  resolveNpmCli,
 } from "./helpers.js";
 import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
 import { readPngDimensions } from "./png.js";
@@ -143,6 +146,56 @@ test.skipIf(process.platform === "win32")(
       expect(process.env["ANDROID_HOME"]).toBe(originalHome);
       expect(process.env["ANDROID_SDK_ROOT"]).toBe(originalRoot);
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(process.platform === "win32").each([false, true])(
+  "POSIX helper installation uses selected Node with restricted PATH, NVM=%s",
+  async (nvm) => {
+    const directory = await mkdtemp(join(tmpdir(), "device-node-toolchain-"));
+    const saved = {
+      PATH: process.env["PATH"],
+      NVM_DIR: process.env["NVM_DIR"],
+      OPENCODE_DEVICE_NODE: process.env["OPENCODE_DEVICE_NODE"],
+      npm_execpath: process.env["npm_execpath"],
+    };
+    try {
+      const prefix = join(directory, "versions", "node", "v24.1.0");
+      const node = join(prefix, "bin", "node");
+      const cli = join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+      await mkdir(join(prefix, "bin"), { recursive: true });
+      await mkdir(join(prefix, "lib", "node_modules", "npm", "bin"), { recursive: true });
+      await writeFile(
+        node,
+        `#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'v24.1.0\\n'; elif [ "$1" = "--print" ]; then printf '%s\\n' "$0"; else exec '${process.execPath}' "$@"; fi\n`,
+        { mode: 0o755 },
+      );
+      await writeFile(
+        cli,
+        `const fs = require("node:fs"); const path = require("node:path"); if (process.argv.includes("--version")) { console.log("10.1.0"); } else { const root = process.argv[process.argv.indexOf("--prefix") + 1]; const child = require("node:child_process").spawnSync("node", ["--version"], {encoding:"utf8"}); if (child.stdout.trim() !== "v24.1.0") process.exit(1); for (const [pkg, version] of Object.entries(${JSON.stringify(PINS)})) { const dir = path.join(root, "node_modules", pkg); fs.mkdirSync(dir, {recursive:true}); fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({version, bin:"cli.js"})); fs.writeFileSync(path.join(dir, "cli.js"), ""); } }`,
+      );
+      process.env["PATH"] = join(directory, "missing-path");
+      process.env["NVM_DIR"] = directory;
+      delete process.env["OPENCODE_DEVICE_NODE"];
+      process.env["npm_execpath"] = join(directory, "unrelated", "npm-cli.js");
+      const selected = await resolveExternalNode(nvm ? undefined : node);
+      expect(selected).toBe(node);
+      expect(await resolveNpmCli(selected)).toBe(cli);
+      const paths = await ensureHelpers(join(directory, "helpers"), 10_000, selected);
+      expect(paths.agentDeviceBin).toBe(
+        join(directory, "helpers", "node_modules", "agent-device", "cli.js"),
+      );
+      await rm(cli);
+      await expect(resolveNpmCli(selected)).rejects.toMatchObject({
+        data: { code: "missing-prerequisite" },
+      });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       await rm(directory, { recursive: true, force: true });
     }
   },

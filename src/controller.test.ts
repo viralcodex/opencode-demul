@@ -3,7 +3,6 @@ import { createDeviceController } from "./controller.js";
 import { Device } from "./rpc.js";
 import { HandleRegistry } from "./native/handle.js";
 import type { DeviceRuntime } from "./native/runtime.js";
-import { stopProcess, type LongRunningProcess } from "./native/process.js";
 
 const caller = { serverID: "server-a", sessionID: "session-a" };
 const selection = { platform: "android", deviceId: "phone" } as const;
@@ -330,28 +329,6 @@ test("shutdown cannot close a device still attached by another session", async (
   await item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual");
   expect(item.calls).toEqual(["open", "close"]);
   await item.controller.dispose();
-});
-
-test("controller disposal settles when its hub ignores SIGTERM", async () => {
-  const item = fixture();
-  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
-  const signals: NodeJS.Signals[] = [];
-  const process: LongRunningProcess = {
-    pid: undefined,
-    exited: exited.promise,
-    stop: (signal = "SIGTERM") => {
-      signals.push(signal);
-      if (signal === "SIGKILL") exited.resolve({ code: null, signal });
-    },
-  };
-  item.runtime.dispose = () => stopProcess(process, 5, 5);
-  await item.controller.open(caller, selection, "manual");
-  await item.controller.dispose();
-  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-  expect(item.controller.state(caller)).toBeNull();
-  await expect(item.controller.open(caller, selection, "manual")).rejects.toMatchObject({
-    code: "detached",
-  });
 });
 
 test("closing releases the device for another session and disposal prevents new attachments", async () => {

@@ -41,6 +41,8 @@
     "test": "bun test",
     "check": "bun run lint && bun run fmt:check && bun run typecheck && bun test",
     "verify:package": "node script/verify-package.mjs",
+    "helpers:lock": "node script/update-helper-lock.mjs",
+    "verify:helpers": "node script/verify-helpers.mjs",
     "release:check": "bun run check && bun run bundle && bun run verify:package"
   },
   "dependencies": {

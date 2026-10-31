@@ -2,7 +2,13 @@ import { homedir } from "node:os";
 import { createServer, type Socket } from "node:net";
 import { posix, win32 } from "node:path";
 import { deviceError } from "./errors.js";
-import { appendBounded, runCommand, spawnProcess, type LongRunningProcess } from "./process.js";
+import {
+  appendBounded,
+  runCommand,
+  spawnProcess,
+  stopProcess,
+  type LongRunningProcess,
+} from "./process.js";
 
 // Android emulator lifecycle. Discovery names an AVD; attachment must turn that into a booted adb serial. Booting is
 // explicit and only happens when the caller asked for it, and the runtime records whether it booted the emulator so it
@@ -174,8 +180,7 @@ export async function ensureBooted(
     return await Promise.race([failed, boot()]);
   } catch (error) {
     abort.abort(error);
-    child?.stop("SIGKILL");
-    await child?.exited;
+    if (child) await stopProcess(child, 0);
     throw error;
   } finally {
     abort.abort();
@@ -197,7 +202,11 @@ async function consoleReport() {
     sockets.add(socket);
     let text = "";
     socket.on("data", (chunk: Buffer) => {
-      text = appendBounded(text, chunk.toString("utf8"), 16);
+      text += chunk.toString("utf8");
+      if (text.length > 16) socket.destroy();
+    });
+    socket.on("end", () => {
+      if (report.serial) return;
       if (!/^\d{4,5}\s*$/u.test(text)) return;
       const port = Number(text.trim());
       if (port >= 5554 && port <= 5682 && port % 2 === 0) report.serial = `emulator-${port}`;

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { deviceError } from "./errors.js";
 
 // The child-process boundary for the native runtime. The plugin's Electron main process never imports a native addon;
 // it spawns the helper CLIs under an external Node runtime and talks to them here. Output is bounded so a chatty or
@@ -83,6 +84,55 @@ export interface LongRunningProcess {
   readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   // Send a termination signal. The process is only asked to stop; `exited` reports when it actually did.
   stop(signal?: NodeJS.Signals): void;
+  release?(): void;
+}
+
+export const STOP_GRACE_MS = 2_000;
+export const STOP_KILL_MS = 2_000;
+const stopping = new WeakMap<LongRunningProcess, Promise<void>>();
+
+export function stopProcess(
+  process: LongRunningProcess,
+  graceMs = STOP_GRACE_MS,
+  killMs = STOP_KILL_MS,
+): Promise<void> {
+  const existing = stopping.get(process);
+  if (existing) return existing;
+  const stop = async () => {
+    try {
+      process.stop("SIGTERM");
+    } catch {}
+    if (await waitForExit(process, graceMs)) return;
+    try {
+      process.stop("SIGKILL");
+    } catch {}
+    if (await waitForExit(process, killMs)) return;
+    process.release?.();
+    throw deviceError(
+      "timeout",
+      "The device helper did not exit after SIGTERM and SIGKILL within the cleanup deadline.",
+    );
+  };
+  const result = stop();
+  stopping.set(process, result);
+  return result;
+}
+
+async function waitForExit(process: LongRunningProcess, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      process.exited.then(
+        () => true,
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export interface SpawnSpec extends Omit<CommandSpec, "timeoutMs" | "input"> {
@@ -115,6 +165,11 @@ export function spawnProcess(spec: SpawnSpec): LongRunningProcess {
     stop: (signal: NodeJS.Signals = "SIGTERM") => {
       if (child.exitCode === null && child.signalCode === null) child.kill(signal);
     },
+    release: () => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+    },
   };
 }
 
@@ -127,13 +182,14 @@ function lineReader(
   if (!stream || !onLine) return;
   let buffer = "";
   stream.on("data", (chunk: Buffer) => {
-    buffer = appendBounded(buffer, chunk.toString("utf8"), maxBytes);
+    buffer += chunk.toString("utf8");
     let index = buffer.indexOf("\n");
     while (index !== -1) {
-      onLine(buffer.slice(0, index).replace(/\r$/u, ""));
+      onLine(appendBounded("", buffer.slice(0, index).replace(/\r$/u, ""), maxBytes));
       buffer = buffer.slice(index + 1);
       index = buffer.indexOf("\n");
     }
+    buffer = appendBounded("", buffer, maxBytes);
   });
   stream.on("close", () => {
     if (buffer.length > 0) onLine(buffer.replace(/\r$/u, ""));

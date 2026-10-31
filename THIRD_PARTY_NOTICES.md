@@ -36,8 +36,9 @@ the plugin archive. Their original packages retain their licenses and notices.
 - agent-device: MIT, copyright 2026 Callstack.
 - expo-device-hub: MIT, copyright 2015-present 650 Industries, Inc. Its vendored
   serve-emu and serve-sim code is Apache-2.0, with licenses in the vendor folders.
-- Native and transitive helper dependencies keep their own licenses. Pinning the
-  helper version does not freeze transitive dependency ranges.
+- Native and transitive helper dependencies keep their own licenses. The plugin
+  includes a separate helper lockfile with exact versions and integrity hashes,
+  including platform-specific optional packages, and installs it with npm ci.
 
 Android SDK, emulator images, ffmpeg and other system tools are installed by the
 user and remain subject to their respective licenses. The plugin does not

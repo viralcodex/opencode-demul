@@ -1,19 +1,69 @@
-import { readFile, access, mkdir, readdir, writeFile } from "node:fs/promises";
+import { readFile, access, mkdir, readdir, realpath, rm, writeFile, lstat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join, posix, win32 } from "node:path";
+import { join, posix, win32, relative, isAbsolute, sep } from "node:path";
 import { Option, Schema } from "effect";
 import { deviceError } from "./errors.js";
 import { parseJson } from "./json.js";
 import { runCommand } from "./process.js";
+import helperPackage from "./helper-package.json" with { type: "json" };
+import helperLock from "./helper-lock.json" with { type: "json" };
 
-// The helper installation and external-runtime resolution. The two automation helpers run under an external Node, not
-// Electron's embedded one, and install into an isolated, caller-owned directory with exact pins, so the repository's
-// lockfile never churns. Nothing here upgrades system tooling; it installs only these two npm packages on request.
-
-// The exact helper versions, pinned after verifying their npm metadata, source, and MIT licensing.
-export const PINS = { "agent-device": "0.21.35", "expo-device-hub": "0.19.0" } as const;
+export const PINS = helperPackage.dependencies;
+export const HELPER_LOCK_HASH = createHash("sha256")
+  .update(JSON.stringify(helperLock))
+  .digest("hex");
 
 export const MIN_NODE = { major: 22, minor: 19 };
+
+export function defaultHelperDir(home = homedir()): string {
+  return join(home, ".cache", "opencode", "device-helpers");
+}
+
+export async function validateHelperDirectory(
+  dir: string,
+  uid = process.getuid?.(),
+): Promise<void> {
+  const metadata = await lstat(dir);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (uid !== undefined && (metadata.uid !== uid || (metadata.mode & 0o077) !== 0))
+  ) {
+    throw deviceError(
+      "missing-prerequisite",
+      "The device helper cache must be a private, user-owned directory without symlinks.",
+    );
+  }
+}
+
+async function trustedPath(root: string, path: string): Promise<boolean> {
+  const child = relative(root, path);
+  if (!child || isAbsolute(child) || child.split(sep).includes(".."))
+    throw deviceError(
+      "missing-prerequisite",
+      "A device helper path escapes its package directory.",
+    );
+  let current = root;
+  for (const part of child.split(sep)) {
+    current = join(current, part);
+    const metadata = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!metadata) return false;
+    if (
+      metadata.isSymbolicLink() ||
+      (current === path ? !metadata.isFile() : !metadata.isDirectory()) ||
+      (process.getuid && (metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0))
+    )
+      throw deviceError(
+        "missing-prerequisite",
+        "A device helper path is symlinked or not owned securely by the current user.",
+      );
+  }
+  return true;
+}
 
 export function parseNodeVersion(output: string) {
   const match = output.match(/v?(\d+)\.(\d+)\.(\d+)/u);
@@ -37,46 +87,51 @@ export interface HelperPaths {
 // The npm command that installs the pinned helpers into `dir` without touching any outer lockfile.
 export function installArgs(
   dir: string,
-  node?: string,
-  npmCli?: string,
+  node: string,
+  npmCli: string,
 ): { command: string; args: string[] } {
   return {
-    command: npmCli ? (node ?? "node") : "npm",
+    command: node,
     args: [
-      ...(npmCli ? [npmCli] : []),
-      "install",
+      npmCli,
+      "ci",
       "--prefix",
       dir,
-      "--no-save",
-      "--no-package-lock",
       "--no-audit",
       "--no-fund",
       "--omit=dev",
-      `agent-device@${PINS["agent-device"]}`,
-      `expo-device-hub@${PINS["expo-device-hub"]}`,
+      "--include=optional",
     ],
   };
 }
 
-// Ensure both helpers are installed in `dir` at their pinned versions and return the resolved CLI entry files. When the
-// bins already resolve the install is skipped, so the step is idempotent and offline after the first run.
 export async function ensureHelpers(
   dir: string,
   timeoutMs = 300_000,
   node = "node",
 ): Promise<HelperPaths> {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await validateHelperDirectory(dir);
+  const stamp = join(dir, ".helper-lock.sha256");
+  for (const file of [stamp, join(dir, "package.json"), join(dir, "package-lock.json")]) {
+    await trustedPath(dir, file);
+  }
+  const previousHash = await readFile(stamp, "utf8").catch(() => null);
   const existing = await resolveHelperPaths(dir);
-  if (existing) return existing;
+  if (existing && previousHash?.trim() === HELPER_LOCK_HASH) return existing;
 
-  await mkdir(dir, { recursive: true });
-  // A manifest lets `npm --prefix` treat the directory as its own project, so the install stays local to it.
-  await writeFile(
-    join(dir, "package.json"),
-    `${JSON.stringify({ name: "opencode-device-helpers", private: true, version: "0.0.0" }, null, 2)}\n`,
-  );
-  const npmCli = process.platform === "win32" ? await resolveNpmCli(node) : undefined;
-  const { command, args } = installArgs(dir, node, npmCli);
-  const result = await runCommand({ command, args, timeoutMs, cwd: dir });
+  await rm(stamp, { force: true });
+  await writeFile(join(dir, "package.json"), `${JSON.stringify(helperPackage, null, 2)}\n`);
+  await writeFile(join(dir, "package-lock.json"), `${JSON.stringify(helperLock, null, 2)}\n`);
+  const npmCli = await resolveNpmCli(node);
+  const projectDir = await realpath(dir);
+  const { command, args } = installArgs(projectDir, node, npmCli);
+  const paths = process.platform === "win32" ? win32 : posix;
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  const env = {
+    [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter),
+  };
+  const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env });
   if (result.code !== 0) {
     const reason =
       result.spawnError ??
@@ -93,11 +148,13 @@ export async function ensureHelpers(
       "missing-prerequisite",
       "The device helpers installed but their CLIs are missing.",
     );
+  await writeFile(stamp, `${HELPER_LOCK_HASH}\n`);
   return resolved;
 }
 
 // Resolve both helper CLI entry files from an existing install, or null when either is not installed.
 export async function resolveHelperPaths(dir: string): Promise<HelperPaths | null> {
+  await validateHelperDirectory(dir);
   const agentDeviceBin = await resolveBin(dir, "agent-device");
   const hubCli = await resolveBin(dir, "expo-device-hub");
   if (!agentDeviceBin || !hubCli) return null;
@@ -113,6 +170,7 @@ const BinManifest = Schema.Struct({
 // Read a package's installed `package.json` and return the absolute path of its named bin, or null when absent.
 async function resolveBin(dir: string, pkg: keyof typeof PINS): Promise<string | null> {
   const root = join(dir, "node_modules", pkg);
+  if (!(await trustedPath(dir, join(root, "package.json")))) return null;
   const raw = await readFile(join(root, "package.json"), "utf8").catch(() => null);
   if (raw === null) return null;
   const manifest = parseJson(BinManifest, raw);
@@ -122,7 +180,7 @@ async function resolveBin(dir: string, pkg: keyof typeof PINS): Promise<string |
     typeof bin === "string" ? bin : bin ? (bin[pkg] ?? Object.values(bin)[0]) : undefined;
   if (!relative) return null;
   const resolved = join(root, relative);
-  return (await exists(resolved)) ? resolved : null;
+  return (await trustedPath(root, resolved)) ? resolved : null;
 }
 
 // Resolve the external Node binary the helpers run under and verify it meets the automation engine's minimum. The
@@ -186,11 +244,11 @@ export function npmCliCandidates(
   const paths = platform === "win32" ? win32 : posix;
   const pathValue = Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
   return [
+    paths.join(paths.dirname(node), "node_modules", "npm", "bin", "npm-cli.js"),
+    paths.join(paths.dirname(node), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     ...(env["npm_execpath"] && paths.basename(env["npm_execpath"]) === "npm-cli.js"
       ? [env["npm_execpath"]]
       : []),
-    paths.join(paths.dirname(node), "node_modules", "npm", "bin", "npm-cli.js"),
-    paths.join(paths.dirname(node), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     ...pathValue
       .split(platform === "win32" ? ";" : ":")
       .filter(Boolean)
@@ -198,9 +256,21 @@ export function npmCliCandidates(
   ];
 }
 
-async function resolveNpmCli(node: string): Promise<string> {
-  for (const candidate of npmCliCandidates(node)) {
-    if (await exists(candidate)) return candidate;
+export async function resolveNpmCli(node: string): Promise<string> {
+  const adjacent =
+    process.platform === "win32"
+      ? undefined
+      : await realpath(join(posix.dirname(node), "npm")).catch(() => undefined);
+  const candidates = [...(adjacent ? [adjacent] : []), ...npmCliCandidates(node)];
+  for (const candidate of candidates) {
+    if (!(await exists(candidate))) continue;
+    const result = await runCommand({
+      command: node,
+      args: [candidate, "--version"],
+      timeoutMs: 10_000,
+    });
+    if (result.code === 0 && !result.timedOut && !result.signal && parseNodeVersion(result.stdout))
+      return candidate;
   }
   throw deviceError(
     "missing-prerequisite",

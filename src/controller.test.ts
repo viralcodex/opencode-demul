@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createDeviceController } from "./controller.js";
 import { Device } from "./rpc.js";
 import { HandleRegistry } from "./native/handle.js";
-import type { DeviceRuntime } from "./native/runtime.js";
+import type { CloseInput, DeviceRuntime } from "./native/runtime.js";
 import { deviceError } from "./native/errors.js";
 
 const caller = { serverID: "server-a", sessionID: "session-a" };
@@ -11,6 +11,7 @@ const selection = { platform: "android", deviceId: "phone" } as const;
 function fixture() {
   const registry = new HandleRegistry();
   const calls: string[] = [];
+  const closes: CloseInput[] = [];
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const runtime: DeviceRuntime = {
@@ -91,35 +92,66 @@ function fixture() {
       registry.require(input.handle);
       registry.release(input.handle);
       calls.push("close");
+      closes.push(input);
     },
     async dispose() {
       calls.push("dispose");
     },
   };
-  return { controller: createDeviceController(runtime), runtime, calls, started, release };
+  return {
+    controller: createDeviceController(runtime),
+    runtime,
+    calls,
+    closes,
+    started,
+    release,
+  };
 }
 
-test("cancelling an in-flight open releases native resources without attaching the session", async () => {
-  const item = fixture();
-  const open = item.runtime.open;
-  item.runtime.open = async (input) => {
-    item.started.resolve();
-    await item.release.promise;
-    return open(input);
-  };
-  const abort = new AbortController();
-  const opening = item.controller.open(caller, selection, "manual", abort.signal);
-  const outcome = opening.catch((error: unknown) => error);
-  await item.started.promise;
-  abort.abort();
-  item.release.resolve();
-  expect(await outcome).toMatchObject({ name: "AbortError" });
-  expect(item.controller.state(caller)).toBeNull();
-  expect(item.calls).toEqual(["open", "close"]);
-  await item.controller.open(caller, selection, "manual");
-  expect(item.calls).toEqual(["open", "close", "open"]);
-  await item.controller.dispose();
-});
+test.each([false, true])(
+  "cancelled opens request shutdown and retry failed rollback on disposal, failure=%s",
+  async (failure) => {
+    const item = fixture();
+    const open = item.runtime.open;
+    item.runtime.open = async (input) => {
+      item.started.resolve();
+      await item.release.promise;
+      return open(input);
+    };
+    const abort = new AbortController();
+    const close = item.runtime.close;
+    if (failure)
+      item.runtime.close = async () => {
+        throw deviceError("timeout", "shutdown failed", true);
+      };
+    const opening = item.controller.open(
+      caller,
+      { ...selection, boot: true },
+      "manual",
+      abort.signal,
+    );
+    const outcome = opening.catch((error: unknown) => error);
+    await item.started.promise;
+    abort.abort();
+    item.release.resolve();
+    expect(await outcome).toMatchObject(
+      failure ? { data: { code: "timeout" } } : { name: "AbortError" },
+    );
+    expect(item.controller.state(caller)).toBeNull();
+    if (failure) {
+      item.runtime.close = close;
+      await item.controller.dispose();
+      expect(item.calls).toEqual(["open", "close", "dispose"]);
+      expect(item.closes[0]?.shutdown).toBe(true);
+      return;
+    }
+    expect(item.calls).toEqual(["open", "close"]);
+    expect(item.closes[0]?.shutdown).toBe(true);
+    await item.controller.open(caller, selection, "manual");
+    expect(item.calls).toEqual(["open", "close", "open"]);
+    await item.controller.dispose();
+  },
+);
 
 test("failed shutdown rejects close and preserves the session for retry", async () => {
   const item = fixture();

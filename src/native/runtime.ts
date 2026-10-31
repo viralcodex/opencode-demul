@@ -23,7 +23,12 @@ import {
   type Automation,
 } from "./automation.js";
 import { deviceError } from "./errors.js";
-import { ensureBooted, resolveAndroidSdkRoot, shutdownEmulator } from "./android.js";
+import {
+  androidHelperEnv,
+  ensureBooted,
+  resolveAndroidSdkRoot,
+  shutdownEmulator,
+} from "./android.js";
 import { androidDevices } from "./discovery.js";
 import { HandleRegistry } from "./handle.js";
 import { ensureHelpers, resolveExternalNode, type HelperPaths } from "./helpers.js";
@@ -163,14 +168,13 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       const cleanups: Array<() => Promise<void>> = [];
       if (bootedByUs) cleanups.push(() => shutdownEmulator({ androidSdkRoot }, deviceId));
       try {
+        const env = androidHelperEnv(androidSdkRoot);
         const hub = await startHub({
           externalNode,
           hubCli: paths.hubCli,
           platform: input.platform,
           deviceId,
-          env: androidSdkRoot
-            ? { ANDROID_HOME: androidSdkRoot, ANDROID_SDK_ROOT: androidSdkRoot }
-            : undefined,
+          env,
         });
         cleanups.push(() => hub.stop().catch(() => undefined));
         const handle = registry.create(input.platform, deviceId);
@@ -184,9 +188,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           platform: input.platform,
           deviceId,
           stateDir,
-          env: androidSdkRoot
-            ? { ANDROID_HOME: androidSdkRoot, ANDROID_SDK_ROOT: androidSdkRoot }
-            : undefined,
+          env,
         });
         cleanups.push(async () => {
           await automation.run(closeArgs(), 10_000).catch(() => undefined);

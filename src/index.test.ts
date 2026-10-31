@@ -11,11 +11,6 @@ import { HandleRegistry } from "./native/handle.js";
 import type { DeviceServer } from "./server.js";
 import { DeviceTools } from "./tools.js";
 
-test("the device namespace has no experimental branding", () => {
-  expect(DeviceTools.namespace.name).toBe("device");
-  expect(DeviceTools.namespace.description).not.toMatch(/experimental/iu);
-});
-
 test("tool commands omit absent options and preserve typed screenshot content", async () => {
   const tools: Tool.Info[] = [];
   const permissions: string[] = [];

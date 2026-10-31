@@ -3,15 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import type { Device } from "./rpc.js";
-import {
-  authorizeBearer,
-  authorizeSubprotocols,
-  buildUpstream,
-  expectedClientSubprotocol,
-  startStreamProxy,
-  videoRequestStatus,
-  type StreamProxy,
-} from "./stream-proxy.js";
+import { startStreamProxy, type StreamProxy } from "./stream-proxy.js";
 
 const HUB_TOKEN = "hub-secret-token";
 
@@ -47,61 +39,6 @@ function listen(server: Server): Promise<number> {
 function proxyVideoUrl(proxy: StreamProxy, query = ""): string {
   return `${proxy.descriptor.baseUrl}/video${query}`;
 }
-
-describe("pure request contract", () => {
-  test("buildUpstream targets the fixed serve-emu video WebSocket for Android", () => {
-    const upstream = buildUpstream(
-      descriptor({ protocol: "h264", baseUrl: "http://127.0.0.1:3400" }),
-    );
-    expect(upstream.kind).toBe("ws");
-    expect(upstream).toEqual({
-      kind: "ws",
-      url: "ws://127.0.0.1:3400/vendor/serve-emu/ws?device=emulator-5554&video=1&frame-meta=1",
-      subprotocol: `serve-emu.token.${HUB_TOKEN}`,
-    });
-  });
-
-  test("buildUpstream targets the vendored serve-sim MJPEG route for iOS with Bearer auth", () => {
-    const upstream = buildUpstream(
-      descriptor({ platform: "ios", protocol: "mjpeg", deviceId: "UDID-1" }),
-    );
-    expect(upstream).toEqual({
-      kind: "mjpeg",
-      url: "http://127.0.0.1:3400/vendor/serve-sim/stream.mjpeg?device=UDID-1",
-      authorization: `Bearer ${HUB_TOKEN}`,
-    });
-  });
-
-  test("videoRequestStatus accepts only GET /video with at most a frame-meta query", () => {
-    expect(videoRequestStatus("GET", "/video")).toBeUndefined();
-    expect(videoRequestStatus("GET", "/video?frame-meta=1")).toBeUndefined();
-    expect(videoRequestStatus("POST", "/video")).toBe(405);
-    expect(videoRequestStatus("GET", "/")).toBe(404);
-    expect(videoRequestStatus("GET", "/video/../secret")).toBe(404);
-    expect(videoRequestStatus("GET", "/stream")).toBe(404);
-    expect(videoRequestStatus("GET", "/video?token=x")).toBe(400);
-    expect(videoRequestStatus("GET", "/video?frame-meta=1&device=x")).toBe(400);
-  });
-
-  test("authorizeBearer matches only the exact token", () => {
-    expect(authorizeBearer("Bearer abc", "abc")).toBe(true);
-    expect(authorizeBearer("Bearer abcd", "abc")).toBe(false);
-    expect(authorizeBearer("Bearer ", "abc")).toBe(false);
-    expect(authorizeBearer("Basic abc", "abc")).toBe(false);
-    expect(authorizeBearer(undefined, "abc")).toBe(false);
-  });
-
-  test("authorizeSubprotocols matches the opencode-device.<token> offer in header or list form", () => {
-    const expected = expectedClientSubprotocol("abc");
-    expect(expected).toBe("opencode-device.abc");
-    expect(authorizeSubprotocols(expected, "abc")).toBe(true);
-    expect(authorizeSubprotocols(` other, ${expected} `, "abc")).toBe(true);
-    expect(authorizeSubprotocols(["other", expected], "abc")).toBe(true);
-    expect(authorizeSubprotocols("opencode-device.abcd", "abc")).toBe(false);
-    expect(authorizeSubprotocols("opencode-device.", "abc")).toBe(false);
-    expect(authorizeSubprotocols(undefined, "abc")).toBe(false);
-  });
-});
 
 describe("MJPEG proxy (iOS)", () => {
   // A stand-in for the hub's serve-sim route: it enforces the fixed path, query, and Bearer token, then streams MJPEG.
@@ -175,32 +112,39 @@ describe("MJPEG proxy (iOS)", () => {
     );
     const token = proxy.descriptor.token;
 
-    expect((await fetch(proxyVideoUrl(proxy))).status).toBe(401);
-    expect(
-      (await fetch(proxyVideoUrl(proxy), { headers: { authorization: "Bearer nope" } })).status,
-    ).toBe(401);
-    expect(
-      (
-        await fetch(proxyVideoUrl(proxy), {
-          method: "POST",
-          headers: { authorization: `Bearer ${token}` },
-        })
-      ).status,
-    ).toBe(405);
-    expect(
-      (
-        await fetch(`${proxy.descriptor.baseUrl}/secret`, {
-          headers: { authorization: `Bearer ${token}` },
-        })
-      ).status,
-    ).toBe(404);
-    expect(
-      (
-        await fetch(proxyVideoUrl(proxy, "?token=x"), {
-          headers: { authorization: `Bearer ${token}` },
-        })
-      ).status,
-    ).toBe(400);
+    for (const authorization of [
+      undefined,
+      "Bearer nope",
+      `Bearer ${token}x`,
+      "Bearer ",
+      `Basic ${token}`,
+    ]) {
+      expect(
+        (
+          await fetch(proxyVideoUrl(proxy), {
+            headers: authorization ? { authorization } : undefined,
+          })
+        ).status,
+      ).toBe(401);
+    }
+    for (const [method, route, httpStatus] of [
+      ["POST", "/video", 405],
+      ["GET", "/", 404],
+      ["GET", "/secret", 404],
+      ["GET", "/video/../secret", 404],
+      ["GET", "/stream", 404],
+      ["GET", "/video?token=x", 400],
+      ["GET", "/video?frame-meta=1&device=x", 400],
+    ] as const) {
+      expect(
+        (
+          await fetch(`${proxy.descriptor.baseUrl}${route}`, {
+            method,
+            headers: { authorization: `Bearer ${token}` },
+          })
+        ).status,
+      ).toBe(httpStatus);
+    }
   });
 
   test("stop closes the listener so the proxy no longer accepts connections", async () => {
@@ -274,6 +218,7 @@ describe("H.264 proxy (Android)", () => {
     );
 
     const client = new WebSocket(proxyVideoUrl(proxy, "?frame-meta=1"), [
+      "other",
       `opencode-device.${proxy.descriptor.token}`,
     ]);
     const messages = await collect(client, 2);
@@ -338,6 +283,12 @@ describe("H.264 proxy (Android)", () => {
     await expect(
       opens(new WebSocket(proxyVideoUrl(proxy), ["opencode-device.wrong"])),
     ).resolves.toBe(false);
+    await expect(
+      opens(new WebSocket(proxyVideoUrl(proxy), [`opencode-device.${proxy.descriptor.token}x`])),
+    ).resolves.toBe(false);
+    await expect(opens(new WebSocket(proxyVideoUrl(proxy), ["opencode-device."]))).resolves.toBe(
+      false,
+    );
     await expect(
       opens(new WebSocket(proxyVideoUrl(proxy), [`serve-emu.token.${proxy.descriptor.token}`])),
     ).resolves.toBe(false);

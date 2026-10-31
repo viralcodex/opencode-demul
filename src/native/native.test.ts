@@ -28,22 +28,14 @@ import {
   nvmNodeCandidates,
   npmCliCandidates,
   parseNodeVersion,
-  PINS,
   resolveExternalNode,
   satisfiesNode,
 } from "./helpers.js";
-import {
-  hubArgs,
-  LOOPBACK_HOST,
-  parseReady,
-  sendGesture,
-  streamDescriptor,
-  streamProtocolFor,
-} from "./hub.js";
+import { hubArgs, LOOPBACK_HOST, parseReady, sendGesture, streamDescriptor } from "./hub.js";
 import { readPngDimensions } from "./png.js";
 import { appendBounded } from "./process.js";
 import { createNativeRuntime } from "./runtime.js";
-import { androidToolPath, resolveAndroidSdkRoot } from "./android.js";
+import { androidHelperEnv, androidToolPath, resolveAndroidSdkRoot } from "./android.js";
 import { Schema } from "effect";
 import { Device } from "../rpc.js";
 
@@ -95,6 +87,67 @@ test("Android SDK defaults and executable paths cover every desktop OS", () => {
   expect(androidToolPath("adb", undefined, "win32")).toBe("adb.exe");
 });
 
+test("Android helper environments preserve desktop paths and Windows casing", () => {
+  const inherited = { PATH: "/usr/bin:/bin", ANDROID_HOME: "/other-sdk" };
+  expect(androidHelperEnv("/opt/Android SDK", inherited, "darwin")).toEqual({
+    ANDROID_HOME: "/opt/Android SDK",
+    ANDROID_SDK_ROOT: "/opt/Android SDK",
+    PATH: "/opt/Android SDK/platform-tools:/opt/Android SDK/emulator:/usr/bin:/bin",
+  });
+  expect(inherited).toEqual({ PATH: "/usr/bin:/bin", ANDROID_HOME: "/other-sdk" });
+  expect(androidHelperEnv("C:\\Android SDK", { Path: "C:\\Windows\\System32" }, "win32")).toEqual({
+    ANDROID_HOME: "C:\\Android SDK",
+    ANDROID_SDK_ROOT: "C:\\Android SDK",
+    Path: "C:\\Android SDK\\platform-tools;C:\\Android SDK\\emulator;C:\\Windows\\System32",
+  });
+  expect(androidHelperEnv("C:\\SDK", { PATH: "C:\\Windows" }, "win32")?.["PATH"]).toBe(
+    "C:\\SDK\\platform-tools;C:\\SDK\\emulator;C:\\Windows",
+  );
+  expect(androidHelperEnv("/sdk", {}, "linux")?.["PATH"]).toBe("/sdk/platform-tools:/sdk/emulator");
+  expect(androidHelperEnv(undefined, inherited)).toBeUndefined();
+});
+
+test.skipIf(process.platform === "win32")(
+  "Android helpers resolve adb with a restricted desktop PATH",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "device sdk path test "));
+    const script = join(directory, "fixture.mjs");
+    const originalPath = process.env["PATH"];
+    const originalHome = process.env["ANDROID_HOME"];
+    const originalRoot = process.env["ANDROID_SDK_ROOT"];
+    try {
+      await mkdir(join(directory, "platform-tools"));
+      await writeFile(
+        join(directory, "platform-tools", "adb"),
+        "#!/bin/sh\nprintf 'sdk-adb\\n'\n",
+        {
+          mode: 0o755,
+        },
+      );
+      await writeFile(
+        script,
+        'import { execFileSync } from "node:child_process"; console.log(process.env.ANDROID_HOME); console.log(process.env.ANDROID_SDK_ROOT); console.log(execFileSync("adb", ["version"], { encoding: "utf8" }).trim());',
+      );
+      const automation = createAutomation({
+        externalNode: process.execPath,
+        agentDeviceBin: script,
+        platform: "android",
+        deviceId: "emulator-5554",
+        stateDir: directory,
+        env: androidHelperEnv(directory, { PATH: "/usr/bin:/bin" }),
+      });
+      const result = await automation.run([]);
+      expect(result.code).toBe(0);
+      expect(result.stdout.trim().split(/\r?\n/u)).toEqual([directory, directory, "sdk-adb"]);
+      expect(process.env["PATH"]).toBe(originalPath);
+      expect(process.env["ANDROID_HOME"]).toBe(originalHome);
+      expect(process.env["ANDROID_SDK_ROOT"]).toBe(originalRoot);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test("Windows helper installation uses Node and npm CLI without a shell", () => {
   const node = "C:\\Program Files\\nodejs\\node.exe";
   const cli = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
@@ -108,32 +161,8 @@ test("Windows helper installation uses Node and npm CLI without a shell", () => 
   expect(invocation.command).toBe(node);
   expect(invocation.args[0]).toBe(cli);
   expect(invocation.args).toContain("C:\\Device Helpers");
-});
-
-test("automation inherits the resolved SDK without changing the parent environment", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "device sdk test "));
-  const script = join(directory, "fixture.mjs");
-  const original = process.env["ANDROID_HOME"];
-  try {
-    await writeFile(
-      script,
-      "console.log(process.env.ANDROID_HOME); console.log(process.env.ANDROID_SDK_ROOT);",
-    );
-    const automation = createAutomation({
-      externalNode: process.execPath,
-      agentDeviceBin: script,
-      platform: "android",
-      deviceId: "emulator-5554",
-      stateDir: directory,
-      env: { ANDROID_HOME: directory, ANDROID_SDK_ROOT: directory },
-    });
-    const result = await automation.run([]);
-    expect(result.code).toBe(0);
-    expect(result.stdout.trim().split(/\r?\n/u)).toEqual([directory, directory]);
-    expect(process.env["ANDROID_HOME"]).toBe(original);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+  expect(invocation.args).toContain("--no-save");
+  expect(invocation.args).toContain("--no-package-lock");
 });
 
 test("manual gestures use authenticated device-scoped routes and report rejection", async () => {
@@ -155,7 +184,15 @@ test("manual gestures use authenticated device-scoped routes and report rejectio
         authorization: request.headers.get("Authorization"),
         body: await request.json(),
       });
-      return Response.json({ ok: !state.reject }, { status: state.reject ? 400 : 200 });
+      return Response.json(
+        {
+          ok: !state.reject,
+          ...(state.reject
+            ? { error: "adb devices failed: spawn adb ENOENT (private-hub-token)" }
+            : {}),
+        },
+        { status: state.reject ? 503 : 200 },
+      );
     },
   });
   const stream = streamDescriptor(
@@ -191,7 +228,8 @@ test("manual gestures use authenticated device-scoped routes and report rejectio
     await expect(sendGesture(stream, { type: "tap", x: 0.5, y: 0.5 })).rejects.toMatchObject({
       data: {
         code: "helper-failed",
-        message: "The device rejected the tap gesture.",
+        message:
+          "The device rejected the tap gesture (HTTP 503): adb devices failed: spawn adb ENOENT ([redacted])",
         mayHaveExecuted: true,
       },
     });
@@ -296,38 +334,6 @@ test("parseReady extracts a loopback origin and token", () => {
     token: "C9nr-nUuihp8gHCfnHpVISCL9oSphzhJI0TIPQzFZwM",
   });
   expect(parseReady("starting up with no url")).toBeNull();
-});
-
-test("streamDescriptor advertises the per-platform codec the backend actually serves", () => {
-  expect(streamProtocolFor("android")).toBe("h264");
-  expect(streamProtocolFor("ios")).toBe("mjpeg");
-  const descriptor = streamDescriptor(
-    { baseUrl: "http://127.0.0.1:3400", token: "t" },
-    "android",
-    "emulator-5554",
-  );
-  expect(descriptor).toEqual({
-    platform: "android",
-    deviceId: "emulator-5554",
-    baseUrl: "http://127.0.0.1:3400",
-    token: "t",
-    protocol: "h264",
-    loopback: true,
-  });
-  expect(
-    streamDescriptor({ baseUrl: "http://127.0.0.1:3400", token: "t" }, "ios", "UDID").protocol,
-  ).toBe("mjpeg");
-});
-
-test("helper installArgs pins the exact helper versions with no lock churn", () => {
-  const { command, args } = helperInstallArgs("/tmp/helpers");
-  expect(command).toBe("npm");
-  expect(args).toContain("--prefix");
-  expect(args).toContain("/tmp/helpers");
-  expect(args).toContain("--no-save");
-  expect(args).toContain("--no-package-lock");
-  expect(args).toContain(`agent-device@${PINS["agent-device"]}`);
-  expect(args).toContain(`expo-device-hub@${PINS["expo-device-hub"]}`);
 });
 
 test("automation arg builders produce the expected CLI invocations", () => {

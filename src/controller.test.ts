@@ -3,6 +3,7 @@ import { createDeviceController } from "./controller.js";
 import { Device } from "./rpc.js";
 import { HandleRegistry } from "./native/handle.js";
 import type { DeviceRuntime } from "./native/runtime.js";
+import { deviceError } from "./native/errors.js";
 
 const caller = { serverID: "server-a", sessionID: "session-a" };
 const selection = { platform: "android", deviceId: "phone" } as const;
@@ -117,6 +118,23 @@ test("cancelling an in-flight open releases native resources without attaching t
   expect(item.calls).toEqual(["open", "close"]);
   await item.controller.open(caller, selection, "manual");
   expect(item.calls).toEqual(["open", "close", "open"]);
+  await item.controller.dispose();
+});
+
+test("failed shutdown rejects close and preserves the session for retry", async () => {
+  const item = fixture();
+  const opened = await item.controller.open(caller, selection, "manual");
+  const close = item.runtime.close;
+  item.runtime.close = async () => {
+    throw deviceError("timeout", "Android shutdown timed out.", true);
+  };
+  await expect(
+    item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual"),
+  ).rejects.toMatchObject({ data: { code: "timeout", mayHaveExecuted: true } });
+  expect(item.controller.state(caller)?.handle).toEqual(opened.handle);
+  item.runtime.close = close;
+  await item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual");
+  expect(item.controller.state(caller)).toBeNull();
   await item.controller.dispose();
 });
 

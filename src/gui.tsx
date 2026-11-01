@@ -15,6 +15,15 @@ import {
 import styles from "./gui.css?inline";
 
 const PANEL_TAB = "device";
+const PLATFORM_GROUPS: ReadonlyArray<{ platform: Device.Platform; label: string }> = [
+  { platform: "android", label: "Android emulators" },
+  { platform: "ios", label: "iOS simulators" },
+];
+
+const deviceLabel = (device: Device.DeviceInfo) =>
+  device.platform === "ios" && device.osVersion
+    ? `${device.name} (iOS ${device.osVersion})`
+    : device.name;
 
 export default Plugin.define({
   setup(ctx) {
@@ -106,7 +115,7 @@ export default Plugin.define({
         if (connectionError() || error()) return;
         if (busy() === "list") return "Finding devices...";
         if (!busy() && !attachment() && devices().length === 0)
-          return "No Android Virtual Devices found.";
+          return "No emulators or simulators found.";
         if (busy() === "open") {
           return devices().find((device) => device.id === selectedDevice())?.state === "shutdown"
             ? "Booting up device..."
@@ -165,9 +174,7 @@ export default Plugin.define({
       };
 
       const refresh = async () => {
-        const value = await outcome("list", () =>
-          bridge.list({ platform: "android", serverID: props.serverID }),
-        );
+        const value = await outcome("list", () => bridge.list({ serverID: props.serverID }));
         if (value?.type !== "devices") return;
         setDevices(value.devices);
         const current = attachment();
@@ -180,7 +187,7 @@ export default Plugin.define({
           );
           return;
         }
-        const first = value.devices[0];
+        const first = value.devices.find((device) => device.state === "booted") ?? value.devices[0];
         if (first) await selectDevice(first.id);
       };
 
@@ -370,8 +377,16 @@ export default Plugin.define({
               <option value="" disabled>
                 {devices().length ? "Select device" : "No devices"}
               </option>
-              <For each={devices()}>
-                {(device) => <option value={device.id}>{device.name}</option>}
+              <For each={PLATFORM_GROUPS}>
+                {(group) => (
+                  <Show when={devices().some((device) => device.platform === group.platform)}>
+                    <optgroup label={group.label}>
+                      <For each={devices().filter((device) => device.platform === group.platform)}>
+                        {(device) => <option value={device.id}>{deviceLabel(device)}</option>}
+                      </For>
+                    </optgroup>
+                  </Show>
+                )}
               </For>
             </select>
             <ctx.ui.Tooltip

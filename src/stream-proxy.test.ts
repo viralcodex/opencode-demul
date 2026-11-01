@@ -56,7 +56,7 @@ describe("MJPEG proxy (iOS)", () => {
         url = request.url;
         auth = request.headers.authorization;
         if (
-          request.url !== "/vendor/serve-sim/stream.mjpeg?device=UDID-1" ||
+          request.url !== "/vendor/serve-sim/helper/stream.mjpeg?device=UDID-1" ||
           auth !== `Bearer ${HUB_TOKEN}`
         ) {
           response.writeHead(401).end();
@@ -87,9 +87,33 @@ describe("MJPEG proxy (iOS)", () => {
     expect(bytes.includes(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]))).toBe(true);
     expect(bytes.includes(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 4, 5, 6]))).toBe(true);
     expect(hub.lastRequest()).toEqual({
-      url: "/vendor/serve-sim/stream.mjpeg?device=UDID-1",
+      url: "/vendor/serve-sim/helper/stream.mjpeg?device=UDID-1",
       auth: `Bearer ${HUB_TOKEN}`,
     });
+  });
+
+  test("allows Authorization preflight only on the fixed video route", async () => {
+    const hub = await fakeSimHub();
+    const proxy = track(await startStreamProxy(simDescriptor(hub.baseUrl)));
+    const response = await fetch(proxyVideoUrl(proxy), {
+      method: "OPTIONS",
+      headers: {
+        origin: "http://localhost:3000",
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization",
+      },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(response.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+      "authorization",
+    );
+    expect(response.headers.get("access-control-allow-methods")).toBe("GET");
+    expect(await response.text()).toBe("");
+    expect(hub.lastRequest()).toEqual({ url: undefined, auth: undefined });
+    expect((await fetch(`${proxy.descriptor.baseUrl}/secret`, { method: "OPTIONS" })).status).toBe(
+      404,
+    );
   });
 
   test("rejects a missing, wrong, or malformed viewer request", async () => {
@@ -270,6 +294,7 @@ async function readMjpeg(url: string, authorization: string): Promise<Buffer> {
   const controller = new AbortController();
   const response = await fetch(url, { headers: { authorization }, signal: controller.signal });
   expect(response.status).toBe(200);
+  expect(response.headers.get("access-control-allow-origin")).toBe("*");
   const reader = response.body!.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;

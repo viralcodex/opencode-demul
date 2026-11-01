@@ -23,6 +23,7 @@ import {
   launchArgs,
   parseApps,
   parseCapabilities,
+  parseFailure,
   parseSnapshotJson,
   pressArgs,
   screenshotArgs,
@@ -80,14 +81,20 @@ import { Device } from "../rpc.js";
 // Decode a branded element reference the way the runtime does, so tests never fabricate a brand by casting.
 const ref = (value: string) => Schema.decodeUnknownSync(Device.ElementRef)(value);
 
-test("unsupported platforms fail before resolving Node or installing helpers", async () => {
-  const runtime = createNativeRuntime({ externalNode: "/missing/device-test-node" });
-  await expect(runtime.list("ios")).rejects.toMatchObject({ data: { code: "unsupported" } });
-  await expect(
-    runtime.open({ platform: "ios", deviceId: "unsupported-device", boot: true }),
-  ).rejects.toMatchObject({ data: { code: "unsupported" } });
-  await runtime.dispose();
-});
+test.skipIf(process.platform === "darwin")(
+  "unsupported platforms fail before resolving Node or installing helpers",
+  async () => {
+    const runtime = createNativeRuntime({ externalNode: "/missing/device-test-node" });
+    try {
+      await expect(runtime.list("ios")).rejects.toMatchObject({ data: { code: "unsupported" } });
+      await expect(
+        runtime.open({ platform: "ios", deviceId: "unsupported-device", boot: true }),
+      ).rejects.toMatchObject({ data: { code: "unsupported" } });
+    } finally {
+      await runtime.dispose();
+    }
+  },
+);
 
 test("missing Android SDK tools report a prerequisite error rather than an empty device list", async () => {
   await expect(
@@ -827,6 +834,186 @@ test("automation arg builders produce the expected CLI invocations", () => {
   expect(capabilitiesArgs()).toEqual(["capabilities", "--json"]);
   expect(closeArgs()).toEqual(["close"]);
 });
+
+test.each([
+  {
+    error: {
+      code: "UNSUPPORTED_OPERATION",
+      message: "Timed out",
+      details: { reason: "ios_app_session_required", dispatched: "no" },
+    },
+    code: "missing-prerequisite",
+    message: "Snapshot needs an app session on iOS; launch the app under test first.",
+    mayHaveExecuted: false,
+  },
+  {
+    error: { code: "UNSUPPORTED_OPERATION", message: "Not supported", hint: "Use another key." },
+    code: "unsupported",
+    message: "Snapshot failed: Not supported Use another key.",
+    mayHaveExecuted: true,
+  },
+  {
+    error: { code: "RUNNER_TIMEOUT", message: "Runner stopped responding" },
+    code: "timeout",
+    message: "Snapshot failed: Runner stopped responding",
+    mayHaveExecuted: true,
+  },
+  {
+    error: { code: "RUNNER_FAILED", message: "Runner TIMED OUT waiting" },
+    code: "timeout",
+    message: "Snapshot failed: Runner TIMED OUT waiting",
+    mayHaveExecuted: true,
+  },
+  {
+    error: { code: "RUNNER_FAILED", message: "Runner failed", hint: "Try again." },
+    code: "helper-failed",
+    message: "Snapshot failed: Runner failed Try again.",
+    mayHaveExecuted: true,
+  },
+  {
+    error: { code: "RUNNER_FAILED", message: "Runner failed", details: { dispatched: "no" } },
+    code: "helper-failed",
+    message: "Snapshot failed: Runner failed",
+    mayHaveExecuted: false,
+  },
+  {
+    error: { code: "RUNNER_FAILED", message: "Runner failed", details: { dispatched: "yes" } },
+    code: "helper-failed",
+    message: "Snapshot failed: Runner failed",
+    mayHaveExecuted: true,
+  },
+])("parseFailure maps helper errors to $code: $message", (input) => {
+  expect(
+    parseFailure(
+      `\n ${JSON.stringify({ success: false, error: input.error })} \n`,
+      "Snapshot",
+      true,
+    ),
+  ).toMatchObject({
+    data: { code: input.code, message: input.message, mayHaveExecuted: input.mayHaveExecuted },
+  });
+});
+
+test("parseFailure preserves an undispatched caller even when the helper reports dispatch", () => {
+  expect(
+    parseFailure(
+      JSON.stringify({
+        success: false,
+        error: { code: "RUNNER_FAILED", message: "Failed", details: { dispatched: "yes" } },
+      }),
+      "Read",
+      false,
+    ),
+  ).toMatchObject({ data: { code: "helper-failed", mayHaveExecuted: false } });
+});
+
+test.each([
+  "not json",
+  "",
+  "null",
+  "{}",
+  JSON.stringify({ success: true, error: { code: "TIMEOUT", message: "Failed" } }),
+  JSON.stringify({ success: false, error: { code: "TIMEOUT" } }),
+])("parseFailure ignores non-envelope output %s", (output) => {
+  expect(parseFailure(output, "Snapshot", true)).toBeNull();
+});
+
+test.each([
+  {
+    stdout: JSON.stringify({
+      success: false,
+      error: { code: "UNSUPPORTED_OPERATION", message: "No key", details: { dispatched: "no" } },
+    }),
+    stderr: JSON.stringify({ success: false, error: { code: "TIMEOUT", message: "Wrong error" } }),
+    code: "unsupported",
+    message: "Key failed: No key",
+    mayHaveExecuted: false,
+  },
+  {
+    stdout: "unstructured output",
+    stderr: JSON.stringify({
+      success: false,
+      error: { code: "TIMEOUT", message: "Runner timeout" },
+    }),
+    code: "timeout",
+    message: "Key failed: Runner timeout",
+    mayHaveExecuted: true,
+  },
+  {
+    stdout: "ignored output",
+    stderr: "old line\n\nlast line\nreason\n",
+    code: "helper-failed",
+    message: "Key failed: last line reason",
+    mayHaveExecuted: true,
+  },
+  {
+    stdout: " stdout reason \n",
+    stderr: "\n \n",
+    code: "helper-failed",
+    message: "Key failed: stdout reason",
+    mayHaveExecuted: true,
+  },
+  {
+    stdout: "",
+    stderr: "",
+    code: "helper-failed",
+    message: "Key failed: exit 1",
+    mayHaveExecuted: true,
+  },
+])("automation require uses $code: $message", (input) => {
+  const automation = createAutomation({
+    externalNode: process.execPath,
+    agentDeviceBin: "/fixture.mjs",
+    platform: "ios",
+    deviceId: "fixture-udid",
+    stateDir: tmpdir(),
+  });
+  const result: CommandResult = {
+    code: 1,
+    signal: null,
+    timedOut: false,
+    stdout: input.stdout,
+    stderr: input.stderr,
+  };
+  expect(() => automation.require(result, "Key", true)).toThrow(
+    expect.objectContaining({
+      data: { code: input.code, message: input.message, mayHaveExecuted: input.mayHaveExecuted },
+    }),
+  );
+});
+
+test.each(["android", "ios"] as const)(
+  "automation run appends --json exactly once before %s selection flags",
+  async (platform) => {
+    const directory = await mkdtemp(join(tmpdir(), "device-json-argv-"));
+    const script = join(directory, "fixture.mjs");
+    try {
+      await writeFile(script, "console.log(JSON.stringify(process.argv.slice(2)));");
+      const automation = createAutomation({
+        externalNode: process.execPath,
+        agentDeviceBin: script,
+        platform,
+        deviceId: "fixture-device",
+        stateDir: directory,
+      });
+      for (const args of [["home"], ["snapshot", "--json"]]) {
+        const original = [...args];
+        const result = automation.require(await automation.run(args), "Fixture");
+        expect(JSON.parse(result.stdout)).toEqual([
+          ...args,
+          ...(args.includes("--json") ? [] : ["--json"]),
+          "--platform",
+          platform,
+          platform === "android" ? "--serial" : "--udid",
+          "fixture-device",
+        ]);
+        expect(args).toEqual(original);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test("parseSnapshotJson reads real nodes, drops structural placeholders, and reports truncation", () => {
   const report = JSON.stringify({

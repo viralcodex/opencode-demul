@@ -4,8 +4,8 @@
 
 <br>
 
-View and control Android (for now) emulators from OpenCode Desktop on Windows, Linux, and
-macOS.
+View and control Android emulators from OpenCode Desktop on Windows, Linux, and macOS, and iOS
+simulators on macOS.
 
 ## Requirements
 
@@ -13,6 +13,7 @@ macOS.
 - Node 22.19+ on the 22.x line, or Node 24+, with npm.
 - Android SDK Platform-Tools and Emulator, a configured Android Virtual Device, and hardware virtualization enabled.
 - ffmpeg with libx264 on the desktop process's PATH.
+- For iOS (macOS only): Xcode with an iOS Simulator runtime, selected with `xcode-select`.
 
 Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` if your SDK is outside the standard Android Studio location.
 Set `OPENCODE_DEVICE_NODE` to your Node executable if the desktop cannot find it.
@@ -33,18 +34,19 @@ Android SDK tools, Node and ffmpeg must already be installed.
 
 ## Use
 
-The panel opens the first configured emulator and starts it if needed. Use the
-picker to switch devices and refresh to rescan.
+The panel opens the first running device, or else the first listed one, and starts it if
+needed. Use the picker to switch between Android emulators and iOS simulators and refresh to
+rescan. Either platform's toolchain may be missing; the picker lists what the host can run.
 
 Agent access starts enabled. Use the switch to revoke access for the current
 session. Agents can only use a device you have opened.
-Installing an APK or shutting down an emulator requires a separate permission prompt.
+Installing an app or shutting down a device requires a separate permission prompt.
 
 Tools use `device_*` names, or `device.*` in Code Mode. They can inspect the
 screen, launch apps, enter text, interact with elements and take screenshots.
 
-Android emulators only (for now).
-[iOS, physical devices, remote servers and direct keyboard input into the panel coming soon.]
+The first iOS automation command builds the agent's XCTest runner, which can take a few minutes.
+[Physical devices, remote servers and direct keyboard input into the panel coming soon.]
 
 Prebuilt plugin files are included.
 

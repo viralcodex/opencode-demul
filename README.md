@@ -23,7 +23,7 @@ Add this entry to your OpenCode configuration.
 
 ```json
 {
-  "plugins": ["github:viralcodex/opencode-demul#v0.1.3"]
+  "plugins": ["github:viralcodex/opencode-demul#v0.1.4"]
 }
 ```
 

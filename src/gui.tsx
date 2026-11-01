@@ -15,10 +15,10 @@ import {
 import styles from "./gui.css?inline";
 
 const PANEL_TAB = "device";
-const PLATFORM_GROUPS: ReadonlyArray<{ platform: Device.Platform; label: string }> = [
-  { platform: "android", label: "Android emulators" },
-  { platform: "ios", label: "iOS simulators" },
-];
+const PLATFORMS: readonly Device.Platform[] = ["android", "ios"];
+
+const firstDevice = (devices: readonly Device.DeviceInfo[]) =>
+  devices.find((device) => device.state === "booted") ?? devices[0];
 
 const deviceLabel = (device: Device.DeviceInfo) =>
   device.platform === "ios" && device.osVersion
@@ -95,6 +95,10 @@ export default Plugin.define({
       const panel = usePanel();
       const [devices, setDevices] = createSignal<readonly Device.DeviceInfo[]>([]);
       const [selectedDevice, setSelectedDevice] = createSignal("");
+      const [selectedPlatform, setSelectedPlatform] = createSignal<Device.Platform>("android");
+      const platformDevices = createMemo(() =>
+        devices().filter((device) => device.platform === selectedPlatform()),
+      );
       const [busy, setBusy] = createSignal<string>();
       const [error, setError] = createSignal<string>();
       const [connectionError, setConnectionError] = createSignal<string>();
@@ -179,15 +183,26 @@ export default Plugin.define({
         setDevices(value.devices);
         const current = attachment();
         if (current) {
-          setSelectedDevice(
-            value.devices.find((device) => device.id === current.handle.deviceId)?.id ??
-              value.devices.find((device) => device.state !== "shutdown")?.id ??
-              value.devices[0]?.id ??
-              "",
-          );
+          if (selectedDevice() !== current.handle.deviceId)
+            setSelectedPlatform(current.handle.platform);
+          setSelectedDevice(current.handle.deviceId);
           return;
         }
-        const first = value.devices.find((device) => device.state === "booted") ?? value.devices[0];
+        const first =
+          firstDevice(platformDevices()) ??
+          (!selectedDevice() ? firstDevice(value.devices) : undefined);
+        if (first) {
+          setSelectedPlatform(first.platform);
+          await selectDevice(first.id);
+        }
+      };
+
+      const selectPlatform = async (platform: Device.Platform) => {
+        if (platform === selectedPlatform()) return;
+        setSelectedPlatform(platform);
+        const first =
+          platformDevices().find((device) => device.id === selectedDevice()) ??
+          firstDevice(platformDevices());
         if (first) await selectDevice(first.id);
       };
 
@@ -216,7 +231,11 @@ export default Plugin.define({
             },
           });
         });
-        if (!value) setSelectedDevice(attachment() ? previous : "");
+        if (!value) {
+          const current = attachment();
+          setSelectedDevice(current ? previous : "");
+          if (current) setSelectedPlatform(current.handle.platform);
+        }
       };
 
       createEffect(() => {
@@ -356,6 +375,35 @@ export default Plugin.define({
           </div>
 
           <footer class="device-panel__picker" aria-label="Device selection">
+            <div class="device-panel__platforms" role="group" aria-label="Device platform">
+              <For each={PLATFORMS}>
+                {(platform) => (
+                  <button
+                    type="button"
+                    class="device-panel__platform"
+                    aria-pressed={selectedPlatform() === platform}
+                    disabled={!!busy()}
+                    onClick={() => void selectPlatform(platform)}
+                  >
+                    {platform === "android" ? "Android" : "iOS"}
+                  </button>
+                )}
+              </For>
+            </div>
+            <select
+              class="device-panel__device-select"
+              aria-label="Device"
+              value={platformDevices().find((device) => device.id === selectedDevice())?.id ?? ""}
+              onChange={(event) => void selectDevice(event.currentTarget.value)}
+              disabled={!!busy() || platformDevices().length === 0}
+            >
+              <option value="" disabled>
+                {platformDevices().length ? "Select device" : "No devices"}
+              </option>
+              <For each={platformDevices()}>
+                {(device) => <option value={device.id}>{deviceLabel(device)}</option>}
+              </For>
+            </select>
             <ctx.ui.Tooltip value="Refresh devices">
               <button
                 type="button"
@@ -367,28 +415,6 @@ export default Plugin.define({
                 <ctx.ui.Icon name="refresh" size="small" />
               </button>
             </ctx.ui.Tooltip>
-            <select
-              class="device-panel__device-select"
-              aria-label="Device"
-              value={selectedDevice()}
-              onChange={(event) => void selectDevice(event.currentTarget.value)}
-              disabled={!!busy() || devices().length === 0}
-            >
-              <option value="" disabled>
-                {devices().length ? "Select device" : "No devices"}
-              </option>
-              <For each={PLATFORM_GROUPS}>
-                {(group) => (
-                  <Show when={devices().some((device) => device.platform === group.platform)}>
-                    <optgroup label={group.label}>
-                      <For each={devices().filter((device) => device.platform === group.platform)}>
-                        {(device) => <option value={device.id}>{deviceLabel(device)}</option>}
-                      </For>
-                    </optgroup>
-                  </Show>
-                )}
-              </For>
-            </select>
             <ctx.ui.Tooltip
               value={
                 attachment()?.agentAccess

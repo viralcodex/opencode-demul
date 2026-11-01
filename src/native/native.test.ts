@@ -30,7 +30,7 @@ import {
   swipeArgs,
   tapArgs,
 } from "./automation.js";
-import { adbState, androidDevices, parseAdbDevices, parseSimctlDevices } from "./discovery.js";
+import { adbState, androidDevices, parseAdbDevices } from "./discovery.js";
 import { HandleRegistry } from "./handle.js";
 import {
   installArgs as helperInstallArgs,
@@ -515,12 +515,15 @@ test.skipIf(process.platform === "win32")(
 test("Windows helper installation uses Node and npm CLI without a shell", () => {
   const node = "C:\\Program Files\\nodejs\\node.exe";
   const cli = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
-  expect(
-    npmCliCandidates(node, { Path: "C:\\Users\\test\\AppData\\Roaming\\npm" }, "win32"),
-  ).toContain(cli);
-  expect(
-    npmCliCandidates(node, { Path: "C:\\Users\\test\\AppData\\Roaming\\npm" }, "win32"),
-  ).toContain("C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\npm\\bin\\npm-cli.js");
+  const candidates = npmCliCandidates(
+    node,
+    { Path: "C:\\Users\\test\\AppData\\Roaming\\npm" },
+    "win32",
+  );
+  expect(candidates).toContain(cli);
+  expect(candidates).toContain(
+    "C:\\Users\\test\\AppData\\Roaming\\npm\\node_modules\\npm\\bin\\npm-cli.js",
+  );
   const invocation = helperInstallArgs("C:\\Device Helpers", node, cli);
   expect(invocation.command).toBe(node);
   expect(invocation.args[0]).toBe(cli);
@@ -894,44 +897,8 @@ test("parseAdbDevices and adbState read running emulators", () => {
   expect(adbState("no device")).toBe("unavailable");
 });
 
-test("parseSimctlDevices reads available booted simulators", () => {
-  const json = JSON.stringify({
-    devices: {
-      "com.apple.CoreSimulator.SimRuntime.iOS-17-5": [
-        { udid: "UDID-1", name: "iPhone 15", state: "Booted", isAvailable: true },
-        { udid: "UDID-2", name: "iPhone SE", state: "Shutdown", isAvailable: false },
-      ],
-    },
-  });
-  const devices = parseSimctlDevices(json);
-  expect(devices).toHaveLength(1);
-  expect(devices[0]).toMatchObject({
-    id: "UDID-1",
-    name: "iPhone 15",
-    platform: "ios",
-    state: "booted",
-  });
-});
-
-test("parseSimctlDevices reports the selected simulator's own state, not any booted device", () => {
-  // The iOS boot check finds the selected udid in this parse rather than scanning the raw JSON for any "Booted"
-  // string, so a different booted simulator never stands in for the shutdown device the caller named.
-  const json = JSON.stringify({
-    devices: {
-      "com.apple.CoreSimulator.SimRuntime.iOS-17-5": [
-        { udid: "UDID-OTHER", name: "iPhone 15", state: "Booted", isAvailable: true },
-        { udid: "UDID-WANTED", name: "iPhone SE", state: "Shutdown", isAvailable: true },
-      ],
-    },
-  });
-  const devices = parseSimctlDevices(json);
-  expect(devices.find((device) => device.id === "UDID-WANTED")?.state).toBe("shutdown");
-  expect(devices.find((device) => device.id === "UDID-OTHER")?.state).toBe("booted");
-});
-
 test("HandleRegistry mints handles, bumps revisions, and enforces reference validity", () => {
-  let counter = 0;
-  const registry = new HandleRegistry(() => `dh_00000000-0000-4000-8000-00000000000${counter++}`);
+  const registry = sequentialRegistry();
   const handle = registry.create("android", "emulator-5554");
   expect(handle.generation).toBe(1);
   expect(registry.revision(handle)).toBe(0);
@@ -951,8 +918,7 @@ test("HandleRegistry mints handles, bumps revisions, and enforces reference vali
 });
 
 test("HandleRegistry rejects a reference from an older generation", () => {
-  let counter = 0;
-  const registry = new HandleRegistry(() => `dh_00000000-0000-4000-8000-00000000000${counter++}`);
+  const registry = sequentialRegistry();
   const first = registry.create("android", "emulator-5554");
   registry.nextSnapshot(first);
   const second = registry.create("android", "emulator-5554");
@@ -966,8 +932,7 @@ test("HandleRegistry rejects a reference from an older generation", () => {
 });
 
 test("HandleRegistry rejects a reference that belongs to a different handle than the one named", () => {
-  let counter = 0;
-  const registry = new HandleRegistry(() => `dh_00000000-0000-4000-8000-00000000000${counter++}`);
+  const registry = sequentialRegistry();
   const deviceA = registry.create("android", "emulator-5554");
   const deviceB = registry.create("android", "emulator-5556");
   const revision = registry.nextSnapshot(deviceA);
@@ -977,8 +942,11 @@ test("HandleRegistry rejects a reference that belongs to a different handle than
     revision,
     ref: ref("@e3"),
   };
-  // Valid against its own device, so a snapshot ref keeps working for the device it came from.
   expect(registry.resolveReference(referenceOnA, deviceA)).toBe(ref("@e3"));
-  // Rejected when dispatched against another device, so an element can never be tapped on the wrong device.
   expect(() => registry.resolveReference(referenceOnA, deviceB)).toThrow();
 });
+
+function sequentialRegistry() {
+  let counter = 0;
+  return new HandleRegistry(() => `dh_00000000-0000-4000-8000-00000000000${counter++}`);
+}

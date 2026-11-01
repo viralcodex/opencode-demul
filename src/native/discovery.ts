@@ -1,13 +1,9 @@
-import { Option, Schema } from "effect";
-import { Device } from "../rpc.js";
+import type { Device } from "../rpc.js";
 import { deviceError } from "./errors.js";
-import { parseJson } from "./json.js";
 import { runCommand } from "./process.js";
 import { androidToolPath } from "./android.js";
 
-// Device discovery. Listing reads the SDK tools directly — `adb` and `emulator` for Android, `simctl` for iOS — so it
-// reports available devices, their boot state, and ownership without booting anything or starting the hub. Boot and
-// attachment stay explicit, in `open`.
+// Listing reads `adb` and `emulator` directly, so it never boots a device or starts the hub.
 
 export interface DiscoveryOptions {
   androidSdkRoot?: string;
@@ -87,48 +83,4 @@ export async function androidDevices(options: DiscoveryOptions): Promise<Device.
       ownership: device ? ("unknown" as const) : ("available" as const),
     };
   });
-}
-
-const SimctlList = Schema.Struct({
-  devices: Schema.Record(
-    Schema.String,
-    Schema.Array(
-      Schema.Struct({
-        udid: Schema.String,
-        name: Schema.String,
-        state: Schema.String,
-        isAvailable: Schema.optional(Schema.Boolean),
-      }),
-    ),
-  ),
-});
-
-// Parse `simctl list devices --json` into iOS discovery entries, dropping unavailable devices.
-export function parseSimctlDevices(output: string): Device.DeviceInfo[] {
-  const parsed = parseJson(SimctlList, output);
-  if (Option.isNone(parsed)) return [];
-  return Object.entries(parsed.value.devices).flatMap(([runtime, devices]) =>
-    devices
-      .filter((device) => device.isAvailable !== false)
-      .map((device) => ({
-        id: device.udid,
-        name: device.name,
-        platform: "ios" as const,
-        osVersion: runtime.split(".").pop(),
-        state: device.state === "Booted" ? ("booted" as const) : ("shutdown" as const),
-        ownership: "unknown" as const,
-      })),
-  );
-}
-
-// List iOS simulators via `simctl`. Returns an empty list when full Xcode, and therefore `simctl`, is absent.
-export async function iosDevices(options: DiscoveryOptions): Promise<Device.DeviceInfo[]> {
-  const timeoutMs = options.timeoutMs ?? 20_000;
-  const result = await runCommand({
-    command: "xcrun",
-    args: ["simctl", "list", "devices", "--json"],
-    timeoutMs,
-  });
-  if (result.code !== 0) return [];
-  return parseSimctlDevices(result.stdout);
 }

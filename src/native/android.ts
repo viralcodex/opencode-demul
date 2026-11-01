@@ -85,7 +85,7 @@ export function androidHelperEnv(
 }
 
 // Find the adb serial of a running emulator whose reported AVD name matches, or null when none is running.
-export async function resolveRunningSerial(
+async function resolveRunningSerial(
   options: AndroidOptions,
   avdName: string,
   run = runCommand,

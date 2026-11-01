@@ -77,8 +77,7 @@ const failureOutcome = Schema.decodeUnknownSync(DeviceBridge.Outcome)({
   error: { code: "device-busy", message: "The device is busy.", mayHaveExecuted: false },
 });
 
-// The session domain is large, but the device server only reads `get`. Every other method is a filler that fails if a
-// future change starts to use it, so the fixture never silently fakes behavior the server did not ask for.
+// The server only reads `session.get`; every other method dies if a future change starts using it.
 const notUsed = (..._args: ReadonlyArray<unknown>): Effect.Effect<never> =>
   Effect.die("The device server does not use this session domain method.");
 
@@ -163,8 +162,7 @@ function harness(sessions: ReadonlyArray<Session.Info>) {
     event: { subscribe: () => Stream.empty },
   };
 
-  // The branded error the real host mints is unconstructable here, so the factory records the rejection and throws,
-  // which the server surfaces as a handler failure; the test inspects the recorded call rather than the opaque value.
+  // The host's branded error is unconstructable here, so the factory records the rejection and throws instead.
   const call = {
     error: (...args: ReadonlyArray<unknown>): never => {
       const [type, message, data] = args;
@@ -172,16 +170,27 @@ function harness(sessions: ReadonlyArray<Session.Info>) {
       throw new Error(`control rpc rejected: ${String(type)}`);
     },
   };
+  const handlers = () => {
+    if (!captured) throw new Error("ControlRpc handlers were not registered.");
+    return captured;
+  };
 
   return {
     ctx,
     call,
     emitted,
     rejections,
-    handlers: () => {
-      if (!captured) throw new Error("ControlRpc handlers were not registered.");
-      return captured;
-    },
+    handlers,
+    attach: (connectionID = CONNECTION) =>
+      Effect.gen(function* () {
+        const fiber = yield* handlers()
+          .attach({ sessionID: SESSION_ID, connectionID, version: 1 }, call)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.yieldNow;
+        return fiber;
+      }),
+    push: (state: DeviceBridge.Attachment) =>
+      handlers().state({ sessionID: SESSION_ID, connectionID: CONNECTION, state }, call),
   };
 }
 
@@ -199,11 +208,7 @@ test("attach registers the connection and announces protocol version 1", async (
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
+      const attach = yield* context.attach();
       expect(context.emitted).toContainEqual({
         type: "attached",
         connectionID: CONNECTION,
@@ -254,11 +259,7 @@ test("state updates require the matching connection", async () => {
   await run(
     Effect.gen(function* () {
       yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
+      const attach = yield* context.attach();
       const exit = yield* context
         .handlers()
         .state(
@@ -292,17 +293,8 @@ test("the state operation returns the pushed attachment without consent or a dev
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithoutAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithoutAccess);
       const value = yield* server.request(Session.ID.make(SESSION_ID), stateOperation);
       expect(value).toEqual({ type: "state", state: attachmentWithoutAccess });
       expect(context.emitted.some((control) => control.type === "command")).toBe(false);
@@ -316,17 +308,8 @@ test("list forwards to the desktop without requiring device access", async () =>
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithoutAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithoutAccess);
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), listOperation)
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -353,17 +336,8 @@ test("a device-bound operation is denied until the session is granted device acc
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithoutAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithoutAccess);
       const error = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
         .pipe(Effect.flip);
@@ -379,17 +353,8 @@ test("open adopts the attached device and rejects a different one", async () => 
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       const adopted = yield* server.request(Session.ID.make(SESSION_ID), openOperation);
       expect(adopted).toEqual({ type: "attachment", attachment: attachmentWithAccess });
       const error = yield* server
@@ -407,17 +372,8 @@ test("a stale device handle is rejected before dispatch", async () => {
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       const error = yield* server
         .request(Session.ID.make(SESSION_ID), staleOperation)
         .pipe(Effect.flip);
@@ -433,17 +389,8 @@ test("a forwarded operation resolves with the desktop's successful outcome", asy
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       expect(server.state(Session.ID.make(SESSION_ID))).toEqual(attachmentWithAccess);
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
@@ -471,17 +418,8 @@ test("a failed outcome surfaces the device error as a tool error", async () => {
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
         .pipe(Effect.forkChild({ startImmediately: true }));
@@ -506,26 +444,13 @@ test("replacing a connection cancels its in-flight request conservatively", asyn
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const first = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const first = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
         .pipe(Effect.forkChild({ startImmediately: true }));
       yield* Effect.yieldNow;
-      const second = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: "connection-b", version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
+      const second = yield* context.attach("connection-b");
       const error = yield* Fiber.join(request).pipe(Effect.flip);
       expect(error.message).toContain("[device.disconnected]");
       yield* Fiber.interrupt(first);
@@ -539,17 +464,8 @@ test("interrupting a request cancels it on the desktop and does not replay", asy
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context
-        .handlers()
-        .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
-      yield* context
-        .handlers()
-        .state(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, state: attachmentWithAccess },
-          context.call,
-        );
+      const attach = yield* context.attach();
+      yield* context.push(attachmentWithAccess);
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
         .pipe(Effect.forkChild({ startImmediately: true }));

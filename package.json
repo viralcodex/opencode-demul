@@ -37,7 +37,6 @@
     "fmt:check": "oxfmt --check --ignore-path .oxfmtignore .",
     "bundle": "node node_modules/vite/bin/vite.js build --configLoader runner && bun build src/index.ts --target=node --format=esm --packages=external --outfile=dist/server.js",
     "typecheck": "tsc6 --noEmit -p tsconfig.test.json",
-    "typecheck:tsc": "bun run typecheck",
     "test": "bun test",
     "check": "bun run lint && bun run fmt:check && bun run typecheck && bun test",
     "verify:package": "node script/verify-package.mjs",

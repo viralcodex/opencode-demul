@@ -133,10 +133,7 @@ export async function ensureHelpers(
   };
   const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env });
   if (result.code !== 0) {
-    const reason =
-      result.spawnError ??
-      result.stderr.split("\n").slice(-3).join(" ").trim() ??
-      "npm install failed";
+    const reason = result.spawnError ?? result.stderr.split("\n").slice(-3).join(" ").trim();
     throw deviceError(
       "missing-prerequisite",
       `Installing the device helpers failed: ${reason || "npm install failed"}`,
@@ -198,7 +195,7 @@ export async function resolveExternalNode(candidate?: string, timeoutMs = 10_000
     if (installed[0]) return resolveExternalNode(installed[0], timeoutMs);
   }
   if (result.code !== 0 || !version) {
-    const reason = result.spawnError ?? result.stderr.trim() ?? "not found";
+    const reason = result.spawnError ?? result.stderr.trim();
     throw deviceError(
       "missing-prerequisite",
       `External Node runtime "${node}" is unavailable: ${reason || "not found"}`,

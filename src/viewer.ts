@@ -257,9 +257,7 @@ function playH264(options: ViewerOptions) {
     if (socket.readyState !== WebSocket.OPEN) return;
     try {
       socket.send(JSON.stringify({ type: "reset-video", ack: false }));
-    } catch {
-      return;
-    }
+    } catch {}
   };
   const reset = (request = false) => {
     configuring++;
@@ -304,10 +302,7 @@ function playH264(options: ViewerOptions) {
   socket.addEventListener("message", (event) => {
     if (stopped) return;
     if (typeof event.data === "string") {
-      const size = videoSessionSize(event.data);
-      if (size) {
-        reset(true);
-      }
+      if (videoSessionSize(event.data)) reset(true);
       return;
     }
     if (!(event.data instanceof ArrayBuffer)) return;
@@ -343,8 +338,7 @@ function playH264(options: ViewerOptions) {
           fail(`H.264 codec ${nextCodec} is not supported by this browser`);
           return;
         }
-        let target: VideoDecoder;
-        target = new VideoDecoder({
+        const target: VideoDecoder = new VideoDecoder({
           output(output) {
             if (stopped || decoder !== target) {
               output.close();

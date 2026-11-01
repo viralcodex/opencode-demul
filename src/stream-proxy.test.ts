@@ -41,6 +41,9 @@ function proxyVideoUrl(proxy: StreamProxy, query = ""): string {
 }
 
 describe("MJPEG proxy (iOS)", () => {
+  const simDescriptor = (baseUrl: string) =>
+    descriptor({ platform: "ios", protocol: "mjpeg", deviceId: "UDID-1", baseUrl });
+
   // A stand-in for the hub's serve-sim route: it enforces the fixed path, query, and Bearer token, then streams MJPEG.
   function fakeSimHub(): Promise<{
     baseUrl: string;
@@ -74,16 +77,7 @@ describe("MJPEG proxy (iOS)", () => {
 
   test("streams the hub body only to a correctly authenticated viewer and hides the hub token", async () => {
     const hub = await fakeSimHub();
-    const proxy = track(
-      await startStreamProxy(
-        descriptor({
-          platform: "ios",
-          protocol: "mjpeg",
-          deviceId: "UDID-1",
-          baseUrl: hub.baseUrl,
-        }),
-      ),
-    );
+    const proxy = track(await startStreamProxy(simDescriptor(hub.baseUrl)));
 
     expect(proxy.descriptor.token).not.toBe(HUB_TOKEN);
     expect(proxy.descriptor.baseUrl.startsWith("http://127.0.0.1:")).toBe(true);
@@ -100,16 +94,7 @@ describe("MJPEG proxy (iOS)", () => {
 
   test("rejects a missing, wrong, or malformed viewer request", async () => {
     const hub = await fakeSimHub();
-    const proxy = track(
-      await startStreamProxy(
-        descriptor({
-          platform: "ios",
-          protocol: "mjpeg",
-          deviceId: "UDID-1",
-          baseUrl: hub.baseUrl,
-        }),
-      ),
-    );
+    const proxy = track(await startStreamProxy(simDescriptor(hub.baseUrl)));
     const token = proxy.descriptor.token;
 
     for (const authorization of [
@@ -149,9 +134,7 @@ describe("MJPEG proxy (iOS)", () => {
 
   test("stop closes the listener so the proxy no longer accepts connections", async () => {
     const hub = await fakeSimHub();
-    const proxy = await startStreamProxy(
-      descriptor({ platform: "ios", protocol: "mjpeg", deviceId: "UDID-1", baseUrl: hub.baseUrl }),
-    );
+    const proxy = await startStreamProxy(simDescriptor(hub.baseUrl));
     const url = proxyVideoUrl(proxy);
     const token = proxy.descriptor.token;
     await proxy.stop();
@@ -211,11 +194,7 @@ describe("H.264 proxy (Android)", () => {
 
   test("forwards hub frames to a subprotocol-authenticated viewer over the fixed route", async () => {
     const hub = await fakeEmuHub();
-    const proxy = track(
-      await startStreamProxy(
-        descriptor({ protocol: "h264", deviceId: "emulator-5554", baseUrl: hub.baseUrl }),
-      ),
-    );
+    const proxy = track(await startStreamProxy(descriptor({ baseUrl: hub.baseUrl })));
 
     const client = new WebSocket(proxyVideoUrl(proxy, "?frame-meta=1"), [
       "other",
@@ -236,11 +215,7 @@ describe("H.264 proxy (Android)", () => {
 
   test("never relays device input or arbitrary client messages upstream", async () => {
     const hub = await fakeEmuHub();
-    const proxy = track(
-      await startStreamProxy(
-        descriptor({ protocol: "h264", deviceId: "emulator-5554", baseUrl: hub.baseUrl }),
-      ),
-    );
+    const proxy = track(await startStreamProxy(descriptor({ baseUrl: hub.baseUrl })));
     const client = new WebSocket(proxyVideoUrl(proxy), [
       `opencode-device.${proxy.descriptor.token}`,
     ]);
@@ -273,11 +248,7 @@ describe("H.264 proxy (Android)", () => {
 
   test("rejects a WebSocket that offers a missing or wrong subprotocol", async () => {
     const hub = await fakeEmuHub();
-    const proxy = track(
-      await startStreamProxy(
-        descriptor({ protocol: "h264", deviceId: "emulator-5554", baseUrl: hub.baseUrl }),
-      ),
-    );
+    const proxy = track(await startStreamProxy(descriptor({ baseUrl: hub.baseUrl })));
 
     await expect(opens(new WebSocket(proxyVideoUrl(proxy)))).resolves.toBe(false);
     await expect(

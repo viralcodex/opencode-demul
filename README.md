@@ -14,7 +14,7 @@ macOS.
 - Android SDK Platform-Tools and Emulator, a configured Android Virtual Device, and hardware virtualization enabled.
 - ffmpeg with libx264 on the desktop process's PATH.
 
-Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` if your SDK is outside the standard Android Studio location. 
+Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` if your SDK is outside the standard Android Studio location.
 Set `OPENCODE_DEVICE_NODE` to your Node executable if the desktop cannot find it.
 
 ## Install
@@ -37,7 +37,7 @@ The panel opens the first configured emulator and starts it if needed. Use the
 picker to switch devices and refresh to rescan.
 
 Agent access starts enabled. Use the switch to revoke access for the current
-session. Agents can only use a device you have opened. 
+session. Agents can only use a device you have opened.
 Installing an APK or shutting down an emulator requires a separate permission prompt.
 
 Tools use `device_*` names, or `device.*` in Code Mode. They can inspect the
@@ -59,5 +59,5 @@ bun run bundle
 bun run verify:package
 ```
 
-MIT license. 
+MIT license.
 Dependency licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

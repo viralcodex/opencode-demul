@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@opencode/plugin-device",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Local Android emulator and iOS simulator viewing and session-bound automation for OpenCode Desktop",
   "keywords": [
     "android",

@@ -153,7 +153,7 @@ test("main is lazy, mints connection identity, confines stream tokens to IPC, an
       if (input.sessionID === sessionID) expect(options?.location).toEqual(location);
       attachment = input;
       queueMicrotask(() =>
-        control?.({ type: "attached", connectionID: input.connectionID, version: 1 }),
+        control({ type: "attached", connectionID: input.connectionID, version: 1 }),
       );
       return new Promise((resolve) =>
         options?.signal?.addEventListener("abort", () => resolve("closed"), { once: true }),
@@ -280,7 +280,7 @@ test("main is lazy, mints connection identity, confines stream tokens to IPC, an
 
   await ipc.access({ scope, enabled: false }, { window: 7, signal: new AbortController().signal });
   operations.set("denied", { type: "apps", handle: opened.value.attachment.handle });
-  control?.({ type: "command", connectionID, requestID: "denied" });
+  control({ type: "command", connectionID, requestID: "denied" });
   await eventually(() => outcomes.has("denied"));
   expect(outcomes.get("denied")).toMatchObject({
     type: "failure",
@@ -290,14 +290,14 @@ test("main is lazy, mints connection identity, confines stream tokens to IPC, an
 
   await ipc.access({ scope, enabled: true }, { window: 7, signal: new AbortController().signal });
   operations.set("apps", { type: "apps", handle: opened.value.attachment.handle });
-  control?.({ type: "command", connectionID, requestID: "apps" });
-  control?.({ type: "command", connectionID, requestID: "apps" });
+  control({ type: "command", connectionID, requestID: "apps" });
+  control({ type: "command", connectionID, requestID: "apps" });
   await eventually(() => outcomes.has("apps"));
   expect(commandFetches.filter((requestID) => requestID === "apps")).toHaveLength(1);
 
   operations.set("cancelled", { type: "apps", handle: opened.value.attachment.handle });
-  control?.({ type: "cancel", connectionID, requestID: "cancelled" });
-  control?.({ type: "command", connectionID, requestID: "cancelled" });
+  control({ type: "cancel", connectionID, requestID: "cancelled" });
+  control({ type: "command", connectionID, requestID: "cancelled" });
   await Promise.resolve();
   expect(commandFetches).not.toContain("cancelled");
 

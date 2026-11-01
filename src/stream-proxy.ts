@@ -6,48 +6,28 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { Schema } from "effect";
 import type { Device } from "./rpc.js";
 
-// A loopback video proxy that fronts the device hub's stream for the renderer. The hub mints one session token that
-// unlocks every hub route; handing that token to the viewer would let the viewer reach the whole hub. Instead the proxy
-// binds its own `127.0.0.1` port and its own random token, exposes exactly one route — `GET /video` — and re-connects
-// upstream to the hub with the hub's credentials, which never leave this process. The viewer therefore holds a token
-// that can reach only the video of one device, and the proxy revokes it by closing when the attachment ends.
-//
-// The upstream routes are the fixed, vendored hub endpoints, not guesses:
-// - Android serves H.264 over the `serve-emu` video WebSocket at `/vendor/serve-emu/ws`, selected with
-// `?device=<id>&video=1&frame-meta=1` and authenticated by the `serve-emu.token.<token>` subprotocol. The stream is
-// video-only: the proxy never forwards a client message upstream, so a compromised viewer cannot drive the device.
-// - iOS serves MJPEG over the `serve-sim` route `/vendor/serve-sim/stream.mjpeg`, selected with `?device=<id>` and
-// authenticated by `Authorization: Bearer <token>`. This route is read from the installed vendor source
-// (`serve-sim/dist/serve-sim.js`: a `GET /stream.mjpeg` handler writing `multipart/x-mixed-replace`), not assumed.
+// A loopback proxy in front of the hub's video stream. The hub token unlocks every hub route, so the viewer gets this
+// proxy's own token instead, which reaches only `GET /video` for one device. Client messages are never relayed upstream
+// except a validated video reset. Upstream routes are the vendored serve-emu (H.264 WebSocket, token subprotocol) and
+// serve-sim (MJPEG GET, Bearer token) endpoints.
 
-// The only host the proxy binds. The video never leaves the machine.
-export const LOOPBACK_HOST = "127.0.0.1";
+const LOOPBACK_HOST = "127.0.0.1";
+const VIDEO_PATH = "/video";
+// The only query key the viewer may pass (`frame-meta=1` for the H.264 metadata header).
+const ALLOWED_QUERY_KEY = "frame-meta";
+const CLIENT_SUBPROTOCOL_PREFIX = "opencode-device.";
+// Beyond this outbound buffer the proxy drops video frames rather than grow.
+const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 
-// The single route the proxy serves. Every other path is a 404.
-export const VIDEO_PATH = "/video";
-
-// The only query key the viewer may pass (`frame-meta=1` for the H.264 metadata header). Any other key is rejected.
-export const ALLOWED_QUERY_KEY = "frame-meta";
-
-// The viewer authenticates a WebSocket by offering this subprotocol with the proxy token appended.
-export const CLIENT_SUBPROTOCOL_PREFIX = "opencode-device.";
-
-// The ceiling on a downstream socket's outbound buffer. Beyond it the proxy drops video frames rather than grow.
-export const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
-
-// A running proxy: the descriptor the viewer connects to, and a `stop` that closes every socket and fetch it owns.
 export interface StreamProxy {
   readonly descriptor: Device.StreamDescriptor;
   stop(): Promise<void>;
 }
 
-// Where the proxy reconnects upstream, derived from the hub descriptor. The two platforms use different transports.
-export type UpstreamTarget =
+type UpstreamTarget =
   | { readonly kind: "ws"; readonly url: string; readonly subprotocol: string }
   | { readonly kind: "mjpeg"; readonly url: string; readonly authorization: string };
 
-// Start the proxy for one hub stream and resolve once it is listening. The returned descriptor points at the proxy, not
-// the hub, so the viewer never sees the hub token. `stop` tears down the listener and every connection it opened.
 export function startStreamProxy(raw: Device.StreamDescriptor): Promise<StreamProxy> {
   const token = randomBytes(24).toString("hex");
   const upstream = buildUpstream(raw);
@@ -108,8 +88,7 @@ export function startStreamProxy(raw: Device.StreamDescriptor): Promise<StreamPr
   });
 }
 
-// Build the fixed upstream hub endpoint for a descriptor. H.264 is a WebSocket; MJPEG is an authenticated GET.
-export function buildUpstream(raw: Device.StreamDescriptor): UpstreamTarget {
+function buildUpstream(raw: Device.StreamDescriptor): UpstreamTarget {
   const origin = new URL(raw.baseUrl).origin;
   if (raw.protocol === "h264") {
     const url = new URL("/vendor/serve-emu/ws", origin);
@@ -124,13 +103,7 @@ export function buildUpstream(raw: Device.StreamDescriptor): UpstreamTarget {
   return { kind: "mjpeg", url: url.toString(), authorization: `Bearer ${raw.token}` };
 }
 
-// The subprotocol a viewer must offer to authenticate a WebSocket connection to the proxy.
-export function expectedClientSubprotocol(token: string): string {
-  return CLIENT_SUBPROTOCOL_PREFIX + token;
-}
-
-// Validate a request line: only `GET`, only `/video`, only the `frame-meta` query. Return a status on rejection.
-export function videoRequestStatus(
+function videoRequestStatus(
   method: string | undefined,
   requestUrl: string | undefined,
 ): number | undefined {
@@ -141,18 +114,13 @@ export function videoRequestStatus(
   return undefined;
 }
 
-// True when an `Authorization` header carries exactly `Bearer <token>`, compared in constant time.
-export function authorizeBearer(header: string | undefined, token: string): boolean {
+function authorizeBearer(header: string | undefined, token: string): boolean {
   const match = /^Bearer (.+)$/u.exec(header ?? "");
   return match ? safeEqual(match[1], token) : false;
 }
 
-// True when one offered WebSocket subprotocol is exactly the expected `opencode-device.<token>`, in constant time.
-export function authorizeSubprotocols(
-  header: string | string[] | undefined,
-  token: string,
-): boolean {
-  const expected = expectedClientSubprotocol(token);
+function authorizeSubprotocols(header: string | string[] | undefined, token: string): boolean {
+  const expected = CLIENT_SUBPROTOCOL_PREFIX + token;
   return subprotocols(header).some((protocol) => safeEqual(protocol, expected));
 }
 

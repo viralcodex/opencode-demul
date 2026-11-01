@@ -118,10 +118,7 @@ export function createMainSetup(
                 "agent",
                 AbortSignal.any([connection.abort.signal, request.signal]),
               ),
-            (error) =>
-              deviceOutcome(() => {
-                throw error;
-              }),
+            (error): DeviceBridge.Outcome => ({ type: "failure", error: failure(error) }),
           );
         if (connection.closed || request.signal.aborted) return;
         await rpc.result(

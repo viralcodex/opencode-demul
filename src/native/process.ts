@@ -87,8 +87,8 @@ export interface LongRunningProcess {
   release?(): void;
 }
 
-export const STOP_GRACE_MS = 2_000;
-export const STOP_KILL_MS = 2_000;
+const STOP_GRACE_MS = 2_000;
+const STOP_KILL_MS = 2_000;
 const stopping = new WeakMap<LongRunningProcess, Promise<void>>();
 
 export function stopProcess(

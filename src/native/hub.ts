@@ -56,20 +56,8 @@ export interface HubReady {
 // The loopback host the hub binds to. The stream never leaves the machine.
 export const LOOPBACK_HOST = "127.0.0.1";
 
-// The wire protocol each backend's video stream actually serves, which is what the viewer must decode. The two backends
-// differ and the hub's `--transport` flag (mjpeg|h264|webrtc, default mjpeg) is only a dashboard preference — it does
-// not change the codec a direct stream connection receives:
-//
-// - Android (the vendored `serve-emu`) always serves **H.264** over its video WebSocket. Its only transports are
-// `websocket` (H.264) and `webrtc` (H.264); it has no MJPEG path. Frames are raw Annex-B (each starts with the
-// `00 00 00 01` start code; a keyframe opens with an SPS NAL `0x67`), or, when the socket is opened with
-// `frame-meta=1`, each frame is prefixed with the `SEMU` (`0x53454d55`) metadata header carrying the keyframe flag.
-// - iOS (the vendored `serve-sim`) serves **MJPEG** (`multipart/x-mixed-replace` with `image/jpeg` parts). This is read
-// from the vendored implementation; it is not verified against a live simulator here.
-//
-// The descriptor advertises this per-platform codec so the viewer decodes what the backend sends, and the hub's own
-// `--transport` preference is pinned to the same value so the dashboard never disagrees with the direct stream.
-export function streamProtocolFor(platform: Device.Platform): Device.StreamProtocol {
+// Android's serve-emu always streams H.264 and iOS's serve-sim streams MJPEG, whatever `--transport` says.
+function streamProtocolFor(platform: Device.Platform): Device.StreamProtocol {
   return platform === "ios" ? "mjpeg" : "h264";
 }
 
@@ -91,9 +79,8 @@ export function hubArgs(options: HubOptions): string[] {
 // Parse a hub ready line such as `Local: http://localhost:3400/?token=abc` into its loopback origin and token.
 export function parseReady(line: string): HubReady | null {
   const match = line.match(/https?:\/\/[^\s]*token=[^\s]+/u);
-  if (!match) return null;
-  const parsed = toUrl(match[0]);
-  if (!parsed) return null;
+  if (!match || !URL.canParse(match[0])) return null;
+  const parsed = new URL(match[0]);
   const token = parsed.searchParams.get("token");
   if (!token) return null;
   return { baseUrl: parsed.origin, token };
@@ -174,8 +161,4 @@ export function startHub(options: HubOptions, spawn = spawnProcess): Promise<Hub
       ),
     );
   });
-}
-
-function toUrl(value: string): URL | null {
-  return URL.canParse(value) ? new URL(value) : null;
 }

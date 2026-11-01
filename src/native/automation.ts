@@ -1,6 +1,6 @@
 import { Option, Schema } from "effect";
 import { Device } from "../rpc.js";
-import { deviceError } from "./errors.js";
+import { deviceError, type DeviceFailure } from "./errors.js";
 import { parseJson } from "./json.js";
 import { runCommand, type CommandResult } from "./process.js";
 
@@ -178,6 +178,45 @@ export function parseCapabilities(output: string): Device.Capability[] | null {
   return keys.filter((capability) => names.has(COMMAND_OF[capability]));
 }
 
+// The `--json` failure envelope. `dispatched: "no"` means the helper refused before touching the device.
+const FailureReport = Schema.Struct({
+  success: Schema.Literal(false),
+  error: Schema.Struct({
+    code: Schema.String,
+    message: Schema.String,
+    hint: Schema.optional(Schema.String),
+    details: Schema.optional(
+      Schema.Struct({
+        reason: Schema.optional(Schema.String),
+        dispatched: Schema.optional(Schema.String),
+      }),
+    ),
+  }),
+});
+
+// Map a structured helper failure to a typed device error, or null when the output carries no envelope.
+export function parseFailure(
+  output: string,
+  action: string,
+  mayHaveExecuted: boolean,
+): DeviceFailure | null {
+  const parsed = parseJson(FailureReport, output.trim());
+  if (Option.isNone(parsed)) return null;
+  const { code, message, hint, details } = parsed.value.error;
+  const executed = details?.dispatched === "no" ? false : mayHaveExecuted;
+  if (details?.reason === "ios_app_session_required")
+    return deviceError(
+      "missing-prerequisite",
+      `${action} needs an app session on iOS; launch the app under test first.`,
+      executed,
+    );
+  const text = `${action} failed: ${message}${hint ? ` ${hint}` : ""}`;
+  if (code === "UNSUPPORTED_OPERATION") return deviceError("unsupported", text, executed);
+  if (code.includes("TIMEOUT") || /timed out/iu.test(message))
+    return deviceError("timeout", text, executed);
+  return deviceError("helper-failed", text, executed);
+}
+
 export interface Automation {
   run(args: readonly string[], timeoutMs?: number): Promise<CommandResult>;
   // Map a non-zero result to a typed device error. `mayHaveExecuted` marks a mutation that was already dispatched.
@@ -197,7 +236,13 @@ export function createAutomation(options: AutomationOptions): Automation {
   const run: Automation["run"] = (args, timeoutMs) =>
     runCommand({
       command: options.externalNode,
-      args: [options.agentDeviceBin, ...args, ...selection],
+      // `--json` makes failures structured, so their code and dispatch certainty survive.
+      args: [
+        options.agentDeviceBin,
+        ...args,
+        ...(args.includes("--json") ? [] : ["--json"]),
+        ...selection,
+      ],
       cwd: options.stateDir,
       env: options.env,
       timeoutMs: timeoutMs ?? timeout,
@@ -207,6 +252,10 @@ export function createAutomation(options: AutomationOptions): Automation {
     if (result.spawnError)
       throw deviceError("helper-failed", `${action} could not start: ${result.spawnError}`);
     if (result.code !== 0) {
+      const structured =
+        parseFailure(result.stdout, action, mayHaveExecuted) ??
+        parseFailure(result.stderr, action, mayHaveExecuted);
+      if (structured) throw structured;
       const reason =
         result.stderr
           .split("\n")

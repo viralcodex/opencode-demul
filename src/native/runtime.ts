@@ -23,13 +23,8 @@ import {
   type Automation,
 } from "./automation.js";
 import { deviceError } from "./errors.js";
-import {
-  androidHelperEnv,
-  ensureBooted,
-  resolveAndroidSdkRoot,
-  shutdownEmulator,
-} from "./android.js";
-import { androidDevices } from "./discovery.js";
+import { resolveAndroidSdkRoot } from "./android.js";
+import { androidBackend, iosBackend, type PlatformBackend } from "./backends.js";
 import { HandleRegistry } from "./handle.js";
 import {
   defaultHelperDir,
@@ -37,7 +32,7 @@ import {
   resolveExternalNode,
   type HelperPaths,
 } from "./helpers.js";
-import { sendGesture, startHub, type HubSession } from "./hub.js";
+import { startHub, type HubSession } from "./hub.js";
 import { readPngDimensions } from "./png.js";
 
 export interface DeviceRuntime {
@@ -101,6 +96,7 @@ const ALL_CAPABILITIES: readonly Device.Capability[] = [
 
 interface Attachment {
   handle: Device.DeviceHandle;
+  backend: PlatformBackend;
   hub: HubSession;
   automation: Automation;
   capabilities: Device.Capabilities;
@@ -112,7 +108,10 @@ interface Attachment {
 export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime {
   const helperDir = options.helperDir ?? defaultHelperDir();
   const stateRoot = options.stateRoot ?? join(tmpdir(), "opencode-device-sessions");
-  const androidSdkRoot = resolveAndroidSdkRoot({ root: options.androidSdkRoot });
+  const backends: Partial<Record<Device.Platform, PlatformBackend>> = {
+    android: androidBackend(resolveAndroidSdkRoot({ root: options.androidSdkRoot })),
+    ...(process.platform === "darwin" ? { ios: iosBackend() } : {}),
+  };
   const attachments = new Map<string, Attachment>();
   let resolvedNode: Promise<string> | null = null;
   let installedHelpers: Promise<HelperPaths> | null = null;
@@ -147,33 +146,44 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
   const registry = new HandleRegistry();
 
+  const backendFor = (platform: Device.Platform) => {
+    if (!["darwin", "linux", "win32"].includes(process.platform))
+      throw deviceError("unsupported", "Device control supports macOS, Linux, and Windows.");
+    const backend = backends[platform];
+    if (!backend) throw deviceError("unsupported", "iOS simulators require a macOS host.");
+    return backend;
+  };
+
   return {
     async list(platform) {
-      if (!["darwin", "linux", "win32"].includes(process.platform))
-        throw deviceError("unsupported", "Device control supports macOS, Linux, and Windows.");
-      if (platform === "ios")
-        throw deviceError("unsupported", "iOS devices are not supported in this release.");
-      return androidDevices({ androidSdkRoot });
+      if (platform) return backendFor(platform).list();
+      const platforms = Object.keys(backends) as Device.Platform[];
+      // One platform's missing toolchain must not hide the other platform's devices.
+      const results = await Promise.allSettled(platforms.map((entry) => backendFor(entry).list()));
+      const listed = results.flatMap((result) =>
+        result.status === "fulfilled" ? result.value : [],
+      );
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failure && results.every((result) => result.status === "rejected")) throw failure.reason;
+      return listed;
     },
 
     async open(input) {
-      if (!["darwin", "linux", "win32"].includes(process.platform))
-        throw deviceError("unsupported", "Device control supports macOS, Linux, and Windows.");
-      if (input.platform !== "android")
-        throw deviceError("unsupported", "iOS devices are not supported in this release.");
+      const backend = backendFor(input.platform);
       const externalNode = await node();
       const paths = await helpers(externalNode);
-      const { serial: deviceId, bootedByUs } = await ensureBooted(
-        { androidSdkRoot },
+      const { deviceId, bootedByUs } = await backend.ensureBooted(
         input.deviceId,
         input.boot ?? false,
       );
       // Everything acquired past this point is torn down in reverse if a later step throws, so a failed open never
-      // leaks the emulator we booted, the hub we spawned, the handle we minted, or the state directory we created.
+      // leaks the device we booted, the hub we spawned, the handle we minted, or the state directory we created.
       const cleanups: Array<() => Promise<void>> = [];
-      if (bootedByUs) cleanups.push(() => shutdownEmulator({ androidSdkRoot }, deviceId));
+      if (bootedByUs) cleanups.push(() => backend.shutdown(deviceId));
       try {
-        const env = androidHelperEnv(androidSdkRoot);
+        const env = backend.env;
         const hub = await startHub({
           externalNode,
           hubCli: paths.hubCli,
@@ -182,6 +192,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           env,
         });
         cleanups.push(() => hub.stop().catch(() => undefined));
+        await backend.streamReady(hub.descriptor);
         const handle = registry.create(input.platform, deviceId);
         cleanups.push(async () => registry.release(handle));
         const stateDir = join(stateRoot, handle.token);
@@ -205,6 +216,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
         const capabilities = await readCapabilities(automation);
         attachments.set(handle.token, {
           handle,
+          backend,
           hub,
           automation,
           capabilities,
@@ -283,9 +295,8 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
     async tap(input) {
       const found = attachment(input.handle, "press");
-      if (found.handle.platform === "android" && input.viewport) {
-        await sendGesture(found.hub.descriptor, {
-          type: "tap",
+      if (input.viewport) {
+        await found.backend.tap(found.hub.descriptor, {
           x: input.point.x / input.viewport.width,
           y: input.point.y / input.viewport.height,
         });
@@ -313,15 +324,13 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
     async swipe(input) {
       const found = attachment(input.handle, "swipe");
-      if (found.handle.platform === "android" && input.viewport) {
-        await sendGesture(found.hub.descriptor, {
-          type: "swipe",
-          x1: input.from.x / input.viewport.width,
-          y1: input.from.y / input.viewport.height,
-          x2: input.to.x / input.viewport.width,
-          y2: input.to.y / input.viewport.height,
-          durationMs: 300,
-        });
+      if (input.viewport) {
+        const { width, height } = input.viewport;
+        await found.backend.swipe(
+          found.hub.descriptor,
+          { x: input.from.x / width, y: input.from.y / height },
+          { x: input.to.x / width, y: input.to.y / height },
+        );
         registry.invalidate(input.handle);
         return;
       }
@@ -335,11 +344,12 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
     async key(input) {
       const found = attachment(input.handle, "key");
-      found.automation.require(
-        await found.automation.run(keyArgs(input.key)),
-        "Pressing the key",
-        true,
-      );
+      if (!(await found.backend.pressKey(found.hub.descriptor, input.key)))
+        found.automation.require(
+          await found.automation.run(keyArgs(input.key)),
+          "Pressing the key",
+          true,
+        );
       registry.invalidate(input.handle);
     },
 
@@ -387,8 +397,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           "This device handle is no longer attached; open the device again.",
         );
       }
-      if (input.shutdown && found.bootedByUs)
-        await shutdownEmulator({ androidSdkRoot }, found.handle.deviceId);
+      if (input.shutdown && found.bootedByUs) await found.backend.shutdown(found.handle.deviceId);
       attachments.delete(input.handle.token);
       registry.release(input.handle);
       await teardown(found);

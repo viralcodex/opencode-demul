@@ -42,9 +42,13 @@ export function startStreamProxy(raw: Device.StreamDescriptor): Promise<StreamPr
   }
 
   const server = createServer((request, response) => {
+    if (upstream.kind === "mjpeg" && request.method === "OPTIONS")
+      return preflight(response, videoRequestStatus("GET", request.url));
     const status = videoRequestStatus(request.method, request.url);
     if (status) return reject(response, status);
     if (upstream.kind !== "mjpeg") return reject(response, 426);
+    // The viewer fetches from the renderer's origin; the Bearer token, not the origin, gates access.
+    response.setHeader("access-control-allow-origin", "*");
     if (!authorizeBearer(request.headers.authorization, token)) return unauthorized(response);
     responses.add(response);
     response.on("close", () => responses.delete(response));
@@ -98,7 +102,7 @@ function buildUpstream(raw: Device.StreamDescriptor): UpstreamTarget {
     url.searchParams.set("frame-meta", "1");
     return { kind: "ws", url: url.toString(), subprotocol: `serve-emu.token.${raw.token}` };
   }
-  const url = new URL("/vendor/serve-sim/stream.mjpeg", origin);
+  const url = new URL("/vendor/serve-sim/helper/stream.mjpeg", origin);
   url.searchParams.set("device", raw.deviceId);
   return { kind: "mjpeg", url: url.toString(), authorization: `Bearer ${raw.token}` };
 }
@@ -250,6 +254,18 @@ function safeEqual(left: string, right: string): boolean {
 
 function reject(response: ServerResponse, status: number) {
   response.writeHead(status).end();
+}
+
+function preflight(response: ServerResponse, status: number | undefined) {
+  if (status) return reject(response, status);
+  response
+    .writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET",
+      "access-control-allow-headers": "authorization",
+      "access-control-max-age": "600",
+    })
+    .end();
 }
 
 function unauthorized(response: ServerResponse) {

@@ -1,14 +1,16 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@opencode/plugin-device",
-  "version": "0.1.4",
-  "description": "Local Android emulator viewing and session-bound automation for OpenCode Desktop on Windows, Linux, and macOS",
+  "version": "0.2.0",
+  "description": "Local Android emulator and iOS simulator viewing and session-bound automation for OpenCode Desktop",
   "keywords": [
     "android",
     "desktop",
     "emulator",
+    "ios",
     "opencode",
-    "opencode-plugin"
+    "opencode-plugin",
+    "simulator"
   ],
   "homepage": "https://github.com/viralcodex/opencode-demul#readme",
   "bugs": {

@@ -18,7 +18,8 @@ const PANEL_TAB = "device";
 const PLATFORMS: readonly Device.Platform[] = ["android", "ios"];
 
 const firstDevice = (devices: readonly Device.DeviceInfo[]) =>
-  devices.find((device) => device.state === "booted") ?? devices[0];
+  devices.find((device) => device.ownership !== "owned-by-other" && device.state === "booted") ??
+  devices.find((device) => device.ownership !== "owned-by-other" && device.state !== "unavailable");
 
 const deviceLabel = (device: Device.DeviceInfo) =>
   device.platform === "ios" && device.osVersion
@@ -115,6 +116,12 @@ export default Plugin.define({
         bridge.state()?.find((entry) => scopeKey(entry.scope) === scopeKey(scope()))?.state ??
         undefined;
       const attachmentToken = createMemo(() => attachment()?.handle.token);
+      createEffect(() => {
+        const current = attachment();
+        if (!current) return;
+        setSelectedPlatform(current.handle.platform);
+        setSelectedDevice(current.selection?.deviceId ?? current.handle.deviceId);
+      });
       const startupMessage = createMemo(() => {
         if (connectionError() || error()) return;
         if (busy() === "list") return "Finding devices...";
@@ -178,14 +185,15 @@ export default Plugin.define({
       };
 
       const refresh = async () => {
-        const value = await outcome("list", () => bridge.list({ serverID: props.serverID }));
+        const value = await outcome("list", () =>
+          bridge.list({ serverID: props.serverID, sessionID: props.sessionID }),
+        );
         if (value?.type !== "devices") return;
         setDevices(value.devices);
         const current = attachment();
         if (current) {
-          if (selectedDevice() !== current.handle.deviceId)
-            setSelectedPlatform(current.handle.platform);
-          setSelectedDevice(current.handle.deviceId);
+          setSelectedPlatform(current.handle.platform);
+          setSelectedDevice(current.selection?.deviceId ?? current.handle.deviceId);
           return;
         }
         const first =
@@ -207,18 +215,9 @@ export default Plugin.define({
       };
 
       const selectDevice = async (id: string) => {
-        const previous = selectedDevice();
         setSelectedDevice(id);
         const value = await outcome("open", async () => {
           await connect(scope());
-          const current = attachment();
-          if (current) {
-            const closed = await bridge.manual({
-              scope: scope(),
-              operation: { type: "close", handle: current.handle },
-            });
-            if (closed.type === "failure") return closed;
-          }
           const device = devices().find((item) => item.id === id);
           if (!device) throw new Error("The selected device is no longer available.");
           return bridge.manual({
@@ -233,7 +232,7 @@ export default Plugin.define({
         });
         if (!value) {
           const current = attachment();
-          setSelectedDevice(current ? previous : "");
+          setSelectedDevice(current?.selection?.deviceId ?? current?.handle.deviceId ?? "");
           if (current) setSelectedPlatform(current.handle.platform);
         }
       };

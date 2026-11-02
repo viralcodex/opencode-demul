@@ -16,7 +16,11 @@ export const Bridge = Ipc.define({
     connect: { input: DeviceBridge.Scope },
     disconnect: { input: DeviceBridge.Scope },
     list: {
-      input: Schema.Struct({ platform: Schema.optional(Device.Platform), serverID: short }),
+      input: Schema.Struct({
+        platform: Schema.optional(Device.Platform),
+        serverID: short,
+        sessionID: Schema.optionalKey(short),
+      }),
       output: DeviceBridge.Outcome,
     },
     access: {

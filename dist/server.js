@@ -227,6 +227,7 @@ var Scope = Schema2.Struct({
 });
 var Attachment = Schema2.Struct({
   handle: exports_rpc.DeviceHandle,
+  selection: Schema2.optionalKey(Schema2.Struct({ platform: exports_rpc.Platform, deviceId: short2 })),
   capabilities: exports_rpc.Capabilities,
   agentAccess: Schema2.Boolean
 }).annotate({ identifier: "DeviceBridge.Attachment" });
@@ -424,12 +425,13 @@ var make = Effect.fn("DeviceServer.make")(function* (ctx) {
     command: (input, call) => Effect.gen(function* () {
       const attachment = attachments.get(input.sessionID);
       const pending = attachment?.connectionID === input.connectionID ? attachment.pending.get(input.requestID) : undefined;
-      if (!pending)
+      if (!pending || pending.claimed)
         return yield* Effect.fail(call.error("unavailable", "Device request is no longer available.", {
           code: "detached",
           message: "Device request is no longer available.",
           mayHaveExecuted: false
         }));
+      pending.claimed = true;
       return pending.operation;
     }),
     result: (input, call) => Effect.gen(function* () {
@@ -454,13 +456,17 @@ var make = Effect.fn("DeviceServer.make")(function* (ctx) {
   const forward = Effect.fn("DeviceServer.forward")(function* (attachment, operation) {
     const requestID = crypto.randomUUID();
     const pending = yield* Deferred.make();
-    attachment.pending.set(requestID, { operation, result: pending });
+    attachment.pending.set(requestID, { operation, result: pending, claimed: false });
     return yield* rpc.events.emit("control", { type: "command", connectionID: attachment.connectionID, requestID }).pipe(Effect.mapError((error) => new Tool.Error({
       message: `Could not dispatch device.${operation.type}. Check the desktop connection, then decide whether to retry.`,
       error
     })), Effect.andThen(Deferred.await(pending)), Effect.raceFirst(Deferred.await(attachment.closed).pipe(Effect.andThen(new Tool.Error({
       message: "[device.disconnected] The device connection closed; the action may already have run. Reconnect this session in the desktop app and re-read device state before repeating a mutating action."
-    })))), Effect.onInterrupt(() => rpc.events.emit("control", { type: "cancel", connectionID: attachment.connectionID, requestID }).pipe(Effect.ignore)), Effect.timeoutOrElse({
+    })))), Effect.onInterrupt(() => Effect.sync(() => attachment.pending.delete(requestID)).pipe(Effect.andThen(rpc.events.emit("control", {
+      type: "cancel",
+      connectionID: attachment.connectionID,
+      requestID
+    })), Effect.ignore)), Effect.timeoutOrElse({
       duration: "60 seconds",
       orElse: () => new Tool.Error({
         message: `[device.timeout] device.${operation.type} did not finish within 60 seconds; its outcome is unknown. Check the desktop connection and re-read device state before repeating a mutating action.`

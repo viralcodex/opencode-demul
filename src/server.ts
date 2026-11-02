@@ -17,7 +17,11 @@ interface Attachment {
   readonly closed: Deferred.Deferred<"closed" | "replaced">;
   readonly pending: Map<
     string,
-    { operation: DeviceBridge.Operation; result: Deferred.Deferred<DeviceBridge.Value, Tool.Error> }
+    {
+      operation: DeviceBridge.Operation;
+      result: Deferred.Deferred<DeviceBridge.Value, Tool.Error>;
+      claimed: boolean;
+    }
   >;
 }
 
@@ -123,7 +127,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
             attachment?.connectionID === input.connectionID
               ? attachment.pending.get(input.requestID)
               : undefined;
-          if (!pending)
+          if (!pending || pending.claimed)
             return yield* Effect.fail(
               call.error("unavailable", "Device request is no longer available.", {
                 code: "detached",
@@ -131,6 +135,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
                 mayHaveExecuted: false,
               }),
             );
+          pending.claimed = true;
           return pending.operation;
         }),
       result: (input, call) =>
@@ -169,7 +174,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
   ) {
     const requestID = crypto.randomUUID();
     const pending = yield* Deferred.make<DeviceBridge.Value, Tool.Error>();
-    attachment.pending.set(requestID, { operation, result: pending });
+    attachment.pending.set(requestID, { operation, result: pending, claimed: false });
     return yield* rpc.events
       .emit("control", { type: "command", connectionID: attachment.connectionID, requestID })
       .pipe(
@@ -192,9 +197,16 @@ export const make = Effect.fn("DeviceServer.make")(function* (
           ),
         ),
         Effect.onInterrupt(() =>
-          rpc.events
-            .emit("control", { type: "cancel", connectionID: attachment.connectionID, requestID })
-            .pipe(Effect.ignore),
+          Effect.sync(() => attachment.pending.delete(requestID)).pipe(
+            Effect.andThen(
+              rpc.events.emit("control", {
+                type: "cancel",
+                connectionID: attachment.connectionID,
+                requestID,
+              }),
+            ),
+            Effect.ignore,
+          ),
         ),
         Effect.timeoutOrElse({
           duration: "60 seconds",

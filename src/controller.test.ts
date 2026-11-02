@@ -219,26 +219,21 @@ test("handles are bound to both server and session and agents cannot attach a di
   ).rejects.toMatchObject({ code: "permission-denied" });
   await expect(
     item.controller.open(caller, { ...selection, deviceId: "other" }, "agent"),
-  ).rejects.toMatchObject({ code: "device-busy" });
+  ).rejects.toMatchObject({ code: "permission-denied" });
   expect(item.calls).toEqual(["open"]);
   await item.controller.dispose();
 });
 
-test("concurrent sessions share one physical device with separate handles and access grants", async () => {
+test("concurrent sessions cannot control the same physical device", async () => {
   const item = fixture();
   const other = { ...caller, sessionID: "session-b" };
-  const opened = await Promise.all([
+  const opened = await Promise.allSettled([
     item.controller.open(caller, selection, "manual"),
     item.controller.open(other, selection, "manual"),
   ]);
-  expect(opened[0].handle.token).not.toBe(opened[1].handle.token);
-  expect(item.controller.state(caller)?.handle).toEqual(opened[0].handle);
-  expect(item.controller.state(other)?.handle).toEqual(opened[1].handle);
-  item.controller.access(caller, false);
-  expect(item.controller.state(other)?.agentAccess).toBe(true);
-  await expect(
-    item.controller.run(other, { type: "screenshot", handle: opened[0].handle }, "agent"),
-  ).rejects.toMatchObject({ code: "permission-denied" });
+  expect(opened[0].status).toBe("fulfilled");
+  expect(opened[1]).toMatchObject({ status: "rejected", reason: { code: "device-busy" } });
+  expect(item.controller.state(other)).toBeNull();
   expect(item.calls).toEqual(["open"]);
   await item.controller.dispose();
 });
@@ -270,17 +265,21 @@ test("revoking agent access rejects a queued action without replaying it", async
   await item.controller.dispose();
 });
 
-test("closing one session preserves the shared device until the last session detaches", async () => {
+test("closing one session preserves another session's device", async () => {
   const item = fixture();
   const other = { ...caller, sessionID: "session-b" };
   const first = await item.controller.open(caller, selection, "manual");
-  const second = await item.controller.open(other, selection, "manual");
+  const second = await item.controller.open(
+    other,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
   await item.controller.close(caller, { handle: first.handle }, "manual");
   expect(item.controller.state(caller)).toBeNull();
   expect(item.controller.state(other)?.handle).toEqual(second.handle);
-  expect(item.calls).toEqual(["open"]);
+  expect(item.calls).toEqual(["open", "open", "close"]);
   expect(await item.controller.stream(other, second.handle)).toMatchObject({
-    deviceId: selection.deviceId,
+    deviceId: "iphone",
   });
   expect(
     await item.controller.run(other, { type: "apps", handle: second.handle }, "agent"),
@@ -288,17 +287,21 @@ test("closing one session preserves the shared device until the last session det
   const reopened = await item.controller.open(caller, selection, "manual");
   expect(reopened.handle.token).not.toBe(first.handle.token);
   await item.controller.close(other, { handle: second.handle }, "manual");
-  expect(item.calls).toEqual(["open", "apps"]);
+  expect(item.calls).toEqual(["open", "open", "close", "apps", "open", "close"]);
   await item.controller.close(caller, { handle: reopened.handle }, "manual");
-  expect(item.calls).toEqual(["open", "apps", "close"]);
+  expect(item.calls).toEqual(["open", "open", "close", "apps", "open", "close", "close"]);
   await item.controller.dispose();
 });
 
-test("actions from different sessions share the device queue without sharing access grants", async () => {
+test("actions on different session devices execute independently", async () => {
   const item = fixture();
   const other = { ...caller, sessionID: "session-b" };
   const first = await item.controller.open(caller, selection, "manual");
-  const second = await item.controller.open(other, selection, "manual");
+  const second = await item.controller.open(
+    other,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
   const running = item.controller.run(
     caller,
     { type: "key", handle: first.handle, key: "home" },
@@ -307,19 +310,23 @@ test("actions from different sessions share the device queue without sharing acc
   await item.started.promise;
   const queued = item.controller.run(other, { type: "apps", handle: second.handle }, "agent");
   item.controller.access(caller, false);
-  expect(item.calls).toEqual(["open", "key"]);
+  expect(await queued).toEqual({ type: "apps", apps: [] });
+  expect(item.calls).toEqual(["open", "open", "key", "apps"]);
   item.release.resolve();
   await running;
-  expect(await queued).toEqual({ type: "apps", apps: [] });
-  expect(item.calls).toEqual(["open", "key", "apps"]);
+  expect(item.calls).toEqual(["open", "open", "key", "apps"]);
   await item.controller.dispose();
 });
 
-test("shared snapshots keep session references isolated and invalidate after another session interacts", async () => {
+test("snapshots remain isolated when another session interacts with its device", async () => {
   const item = fixture();
   const other = { ...caller, sessionID: "session-b" };
   const first = await item.controller.open(caller, selection, "manual");
-  const second = await item.controller.open(other, selection, "manual");
+  const second = await item.controller.open(
+    other,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
   const value = await item.controller.run(
     other,
     { type: "snapshot", handle: second.handle },
@@ -351,8 +358,8 @@ test("shared snapshots keep session references isolated and invalidate after ano
     { type: "tap", handle: first.handle, point: { x: 1, y: 1 } },
     "manual",
   );
-  await expect(
-    item.controller.run(
+  expect(
+    await item.controller.run(
       other,
       {
         type: "press",
@@ -361,23 +368,27 @@ test("shared snapshots keep session references isolated and invalidate after ano
       },
       "agent",
     ),
-  ).rejects.toMatchObject({ code: "stale-reference" });
+  ).toEqual({ type: "done" });
   await item.controller.dispose();
 });
 
-test("shutdown cannot close a device still attached by another session", async () => {
+test("shutdown cannot target another session's device", async () => {
   const item = fixture();
   const opened = await item.controller.open(caller, selection, "manual");
   const other = { ...caller, sessionID: "session-b" };
-  const shared = await item.controller.open(other, selection, "manual");
+  const separate = await item.controller.open(
+    other,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
   await expect(
-    item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual"),
-  ).rejects.toMatchObject({ code: "device-busy" });
-  expect(item.controller.state(other)?.handle).toEqual(shared.handle);
-  expect(item.calls).toEqual(["open"]);
-  await item.controller.close(other, { handle: shared.handle }, "manual");
+    item.controller.close(caller, { handle: separate.handle, shutdown: true }, "manual"),
+  ).rejects.toMatchObject({ code: "permission-denied" });
+  expect(item.controller.state(other)?.handle).toEqual(separate.handle);
+  expect(item.calls).toEqual(["open", "open"]);
+  await item.controller.close(other, { handle: separate.handle }, "manual");
   await item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual");
-  expect(item.calls).toEqual(["open", "close"]);
+  expect(item.calls).toEqual(["open", "open", "close", "close"]);
   await item.controller.dispose();
 });
 

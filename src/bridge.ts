@@ -24,6 +24,7 @@ export type Scope = typeof Scope.Type;
 
 export const Attachment = Schema.Struct({
   handle: Device.DeviceHandle,
+  selection: Schema.optionalKey(Schema.Struct({ platform: Device.Platform, deviceId: short })),
   capabilities: Device.Capabilities,
   agentAccess: Schema.Boolean,
 }).annotate({ identifier: "DeviceBridge.Attachment" });

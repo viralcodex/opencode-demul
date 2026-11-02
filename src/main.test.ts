@@ -295,11 +295,11 @@ test("main is lazy, mints connection identity, confines stream tokens to IPC, an
   await eventually(() => outcomes.has("apps"));
   expect(commandFetches.filter((requestID) => requestID === "apps")).toHaveLength(1);
 
-  operations.set("cancelled", { type: "apps", handle: opened.value.attachment.handle });
   control({ type: "cancel", connectionID, requestID: "cancelled" });
   control({ type: "command", connectionID, requestID: "cancelled" });
   await Promise.resolve();
-  expect(commandFetches).not.toContain("cancelled");
+  await eventually(() => outcomes.has("cancelled"));
+  expect(outcomes.get("cancelled")).toMatchObject({ type: "failure" });
 
   const otherScope = { sessionID: Session.ID.create(), serverID: "sidecar" };
   const ipcCaller = { window: 7, signal: new AbortController().signal };

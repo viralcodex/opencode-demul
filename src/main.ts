@@ -14,18 +14,18 @@ import type { Device } from "./rpc.js";
 import { startStreamProxy, type StreamProxy } from "./stream-proxy.js";
 
 interface Connection {
-  window: number;
+  windows: Set<number>;
+  ready: Promise<void>;
+  reporting: Promise<void>;
   sessionID: string;
   serverID: string;
   location: DeviceBridge.Scope["location"];
   connectionID: string;
   abort: AbortController;
   requests: Map<string, AbortController>;
-  seen: Set<string>;
-  cancelled: Set<string>;
   stopEvents: () => void;
   closed: boolean;
-  proxy?: Promise<StreamProxy>;
+  proxy?: { token: string; pending: Promise<StreamProxy> };
 }
 
 export function createMainSetup(
@@ -34,8 +34,11 @@ export function createMainSetup(
   return (ctx) => {
     let controller: DeviceController | undefined;
     const connections = new Map<string, Connection>();
-    const connectionKey = (scope: DeviceBridge.Scope, window: number) =>
-      JSON.stringify([window, scope.serverID, scope.sessionID]);
+    const bindings = new Map<string, DeviceCaller>();
+    const lifecycle = new AbortController();
+    let watching = false;
+    const connectionKey = (scope: DeviceCaller) =>
+      JSON.stringify([scope.serverID, scope.sessionID]);
     const getController = () => (controller ??= createDeviceController(runtime()));
     const requireLocal = (serverID: string) => {
       if (!ctx.serverEndpoints.get(serverID)?.sameMachine) {
@@ -46,57 +49,83 @@ export function createMainSetup(
       }
     };
     const caller = (connection: Connection): DeviceCaller => ({
-      serverID: connection.connectionID,
+      serverID: connection.serverID,
       sessionID: connection.sessionID,
     });
     const current = (scope: DeviceBridge.Scope, window: number) => {
       requireLocal(scope.serverID);
-      const connection = connections.get(connectionKey(scope, window));
-      if (!connection || connection.closed) throw new Error("device.bridge.disconnected");
+      const connection = connections.get(connectionKey(scope));
+      if (!connection || connection.closed || !connection.windows.has(window))
+        throw new Error("device.bridge.disconnected");
       return connection;
     };
-    const report = async (connection: Connection) => {
-      if (connection.closed) return;
-      if (!getController().state(caller(connection)) && connection.proxy) {
-        await (await connection.proxy).stop();
-        connection.proxy = undefined;
-      }
-      provider.changed(connection.window);
-      await ctx.client.rpc(DeviceBridge.ControlRpc).state(
-        {
-          sessionID: connection.sessionID,
-          connectionID: connection.connectionID,
-          state: getController().state(caller(connection)),
-        },
-        { signal: connection.abort.signal, location: connection.location },
-      );
+    const changed = (connection: Connection) =>
+      connection.windows.forEach((window) => provider.changed(window));
+    const stopProxy = async (connection: Connection) => {
+      const proxy = connection.proxy;
+      connection.proxy = undefined;
+      await proxy?.pending.then((value) => value.stop()).catch(() => undefined);
     };
-    const disconnect = async (connection: Connection) => {
-      const key = connectionKey(connection, connection.window);
+    const report = (connection: Connection) => {
+      const result = connection.reporting.then(async () => {
+        if (connection.closed) return;
+        const state = getController().state(caller(connection));
+        if (connection.proxy && connection.proxy.token !== state?.handle.token)
+          await stopProxy(connection);
+        changed(connection);
+        await ctx.client.rpc(DeviceBridge.ControlRpc).state(
+          {
+            sessionID: connection.sessionID,
+            connectionID: connection.connectionID,
+            state,
+          },
+          { signal: connection.abort.signal, location: connection.location },
+        );
+      });
+      connection.reporting = result.catch(() => undefined);
+      return result;
+    };
+    const disconnect = async (connection: Connection, releaseDevice = false) => {
+      const key = connectionKey(connection);
       if (connection.closed || connections.get(key) !== connection) return;
       connection.closed = true;
       connections.delete(key);
       connection.stopEvents();
       connection.abort.abort();
       connection.requests.forEach((request) => request.abort());
-      if (connection.proxy)
-        await connection.proxy.then((proxy) => proxy.stop()).catch(() => undefined);
-      const state = controller?.state(caller(connection));
-      if (state) {
-        await controller
-          ?.close(caller(connection), { handle: state.handle }, "manual")
-          .catch(() => undefined);
-      }
-      provider.changed(connection.window);
+      await stopProxy(connection);
+      if (releaseDevice) await controller?.detach(caller(connection));
+      if (!controller?.state(caller(connection))) bindings.delete(key);
+      changed(connection);
+    };
+    const watchSessions = () => {
+      if (watching) return;
+      watching = true;
+      void (async () => {
+        for await (const event of ctx.client.event.subscribe({ signal: lifecycle.signal })) {
+          if (event.type !== "session.deleted" && event.type !== "session.moved") continue;
+          for (const [key, owner] of bindings) {
+            if (owner.sessionID !== event.data.sessionID) continue;
+            bindings.delete(key);
+            const connection = connections.get(key);
+            if (connection) await disconnect(connection, true);
+            else await controller?.detach(owner);
+          }
+        }
+      })().catch((error) => {
+        if (!lifecycle.signal.aborted)
+          ctx.log.write("warn", "device session events failed", { error: String(error) });
+      });
+    };
+    const unsubscribe = async (connection: Connection, window: number) => {
+      connection.windows.delete(window);
+      provider.changed(window);
+      if (connection.windows.size) return;
+      await stopProxy(connection);
+      if (!controller?.state(caller(connection))) await disconnect(connection);
     };
     const command = async (connection: Connection, requestID: string) => {
-      if (
-        connection.closed ||
-        connection.seen.has(requestID) ||
-        connection.cancelled.has(requestID)
-      )
-        return;
-      connection.seen.add(requestID);
+      if (connection.closed || connection.requests.has(requestID)) return;
       const request = new AbortController();
       connection.requests.set(requestID, request);
       const rpc = ctx.client.rpc(DeviceBridge.ControlRpc);
@@ -139,36 +168,29 @@ export function createMainSetup(
         connection.requests.delete(requestID);
       }
     };
-    const connect = async (
-      sessionID: string,
-      serverID: string,
-      window: number,
-      signal: AbortSignal,
-      location: DeviceBridge.Scope["location"],
-    ) => {
-      signal.throwIfAborted();
-      requireLocal(serverID);
-      const previous = connections.get(connectionKey({ sessionID, serverID }, window));
-      if (previous) await disconnect(previous);
-      signal.throwIfAborted();
+    const createConnection = (scope: DeviceBridge.Scope) => {
+      const { sessionID, serverID, location } = scope;
       getController();
+      watchSessions();
       const connectionID = crypto.randomUUID();
       const abort = new AbortController();
       const ready = Promise.withResolvers<void>();
       const connection: Connection = {
-        window,
+        windows: new Set(),
+        ready: ready.promise,
+        reporting: Promise.resolve(),
         sessionID,
         serverID,
         location,
         connectionID,
         abort,
         requests: new Map(),
-        seen: new Set(),
-        cancelled: new Set(),
         stopEvents: () => undefined,
         closed: false,
       };
-      connections.set(connectionKey(connection, window), connection);
+      connection.ready = ready.promise.then(() => report(connection));
+      connections.set(connectionKey(connection), connection);
+      bindings.set(connectionKey(connection), caller(connection));
       const rpc = ctx.client.rpc(DeviceBridge.ControlRpc);
       connection.stopEvents = rpc.events.on(
         "control",
@@ -176,7 +198,6 @@ export function createMainSetup(
           if (event.data.connectionID !== connectionID || connection.closed) return;
           if (event.data.type === "attached") return ready.resolve();
           if (event.data.type === "cancel") {
-            connection.cancelled.add(event.data.requestID);
             connection.requests.get(event.data.requestID)?.abort();
             return;
           }
@@ -204,23 +225,46 @@ export function createMainSetup(
           return disconnect(connection);
         },
       );
+      return connection;
+    };
+    const connect = async (scope: DeviceBridge.Scope, window: number, signal: AbortSignal) => {
+      signal.throwIfAborted();
+      requireLocal(scope.serverID);
+      const connection = connections.get(connectionKey(scope)) ?? createConnection(scope);
+      connection.windows.add(window);
+      const aborted = Promise.withResolvers<never>();
       const cancelled = () => {
-        ready.reject(signal.reason);
-        void disconnect(connection);
+        aborted.reject(signal.reason);
+        void unsubscribe(connection, window);
       };
       signal.addEventListener("abort", cancelled, { once: true });
       try {
-        await ready.promise;
-        await report(connection);
+        if (signal.aborted) cancelled();
+        await Promise.race([connection.ready, aborted.promise]);
+        signal.throwIfAborted();
+        provider.changed(window);
       } finally {
         signal.removeEventListener("abort", cancelled);
       }
+    };
+    const requireStream = (
+      connection: Connection,
+      input: { scope: DeviceBridge.Scope; handle: Device.DeviceHandle },
+      window: number,
+      signal: AbortSignal,
+    ) => {
+      signal.throwIfAborted();
+      if (
+        current(input.scope, window) !== connection ||
+        getController().state(caller(connection))?.handle.token !== input.handle.token
+      )
+        throw deviceError("detached", "The device stream has changed; reconnect the viewer.");
     };
 
     const provider = ctx.provide(DeviceIpc.Bridge, {
       state: (window: number) => {
         return [...connections.values()]
-          .filter((connection) => connection.window === window)
+          .filter((connection) => connection.windows.has(window))
           .map((connection) => ({
             scope: {
               sessionID: connection.sessionID,
@@ -230,22 +274,18 @@ export function createMainSetup(
             state: controller?.state(caller(connection)) ?? null,
           }));
       },
-      connect: (input, ipcCaller) =>
-        connect(
-          input.sessionID,
-          input.serverID,
-          ipcCaller.window,
-          ipcCaller.signal,
-          input.location,
-        ),
+      connect: (input, ipcCaller) => connect(input, ipcCaller.window, ipcCaller.signal),
       disconnect: (input, ipcCaller) => {
-        const connection = connections.get(connectionKey(input, ipcCaller.window));
-        return connection ? disconnect(connection) : Promise.resolve();
+        const connection = connections.get(connectionKey(input));
+        return connection ? unsubscribe(connection, ipcCaller.window) : Promise.resolve();
       },
       list: async (input) =>
         deviceOutcome(async () => {
           requireLocal(input.serverID);
-          return { type: "devices", devices: await getController().list(input.platform) };
+          const owner = input.sessionID
+            ? { serverID: input.serverID, sessionID: input.sessionID }
+            : undefined;
+          return { type: "devices", devices: await getController().list(input.platform, owner) };
         }),
       access: async (input, ipcCaller) => {
         const connection = current(input.scope, ipcCaller.window);
@@ -263,7 +303,7 @@ export function createMainSetup(
           caller(connection),
           input.operation,
           "manual",
-          ipcCaller.signal,
+          AbortSignal.any([connection.abort.signal, ipcCaller.signal]),
         );
         await report(connection).catch(() => undefined);
         return outcome;
@@ -272,13 +312,25 @@ export function createMainSetup(
         const connection = current(input.scope, ipcCaller.window);
         return deviceStreamOutcome(async () => {
           const raw = await getController().stream(caller(connection), input.handle);
-          ipcCaller.signal.throwIfAborted();
-          if (connection.closed) throw new Error("device.bridge.disconnected");
-          connection.proxy ??= startStreamProxy(raw).catch((error) => {
-            connection.proxy = undefined;
-            throw error;
-          });
-          return (await connection.proxy).descriptor;
+          requireStream(connection, input, ipcCaller.window, ipcCaller.signal);
+          if (connection.proxy && connection.proxy.token !== input.handle.token)
+            await stopProxy(connection);
+          if (!connection.proxy) {
+            const proxy = {
+              token: input.handle.token,
+              pending: startStreamProxy(raw),
+            };
+            connection.proxy = proxy;
+            void proxy.pending.catch(() => {
+              if (connection.proxy === proxy) connection.proxy = undefined;
+            });
+          }
+          const proxy = connection.proxy;
+          const stream = await proxy.pending;
+          requireStream(connection, input, ipcCaller.window, ipcCaller.signal);
+          if (connection.proxy !== proxy)
+            throw deviceError("detached", "The device stream has changed; reconnect the viewer.");
+          return stream.descriptor;
         });
       },
     });
@@ -287,13 +339,15 @@ export function createMainSetup(
       ctx.windows.on("close", (window) => {
         void Promise.all(
           [...connections.values()]
-            .filter((connection) => connection.window === window.id)
-            .map(disconnect),
+            .filter((connection) => connection.windows.has(window.id))
+            .map((connection) => unsubscribe(connection, window.id)),
         );
       }),
     );
     ctx.onCleanup(async () => {
-      await Promise.all([...connections.values()].map(disconnect));
+      lifecycle.abort();
+      await Promise.all([...connections.values()].map((connection) => disconnect(connection)));
+      bindings.clear();
       await controller?.dispose();
     });
   };
@@ -310,7 +364,7 @@ export async function runOperation(
     signal?.throwIfAborted();
     switch (operation.type) {
       case "list":
-        return { type: "devices", devices: await controller.list(operation.platform) };
+        return { type: "devices", devices: await controller.list(operation.platform, caller) };
       case "state":
         return { type: "state", state: controller.state(caller) };
       case "open":

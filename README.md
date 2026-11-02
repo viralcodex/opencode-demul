@@ -24,7 +24,7 @@ Add this entry to your OpenCode configuration.
 
 ```json
 {
-  "plugins": ["github:viralcodex/opencode-demul#v0.2.0"]
+  "plugins": ["github:viralcodex/opencode-demul#v0.3.0"]
 }
 ```
 
@@ -34,9 +34,17 @@ Android SDK tools, Node and ffmpeg must already be installed.
 
 ## Use
 
-The panel opens the first running device, or else the first listed one, and starts it if
-needed. Use the picker to switch between Android emulators and iOS simulators and refresh to
-rescan. Either platform's toolchain may be missing; the picker lists what the host can run.
+The panel opens the first available running device, or else the first available listed one,
+and starts it if needed. Use the platform and device pickers to switch between Android
+emulators and iOS simulators, and refresh to rescan. Either platform's toolchain may be
+missing; the picker lists what the host can run.
+
+Each session controls its own device. Run iOS and Android side by side in separate sessions;
+a device already controlled by another session cannot be attached. Tabs and windows showing
+the same session share its device and agent-access setting. Closing a viewer stops its video
+without detaching the device, so agents can keep working. Detach the device in the panel to
+release it; deleting or moving the session also releases it. A failed device switch keeps the
+previous attachment.
 
 Agent access starts enabled. Use the switch to revoke access for the current
 session. Agents can only use a device you have opened.

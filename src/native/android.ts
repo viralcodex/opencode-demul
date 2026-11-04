@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { createServer, type Socket } from "node:net";
 import { posix, win32 } from "node:path";
 import { deviceError } from "./errors.js";
+import { parseAdbDevices } from "./adb.js";
 import {
   appendBounded,
   runCommand,
@@ -10,9 +11,7 @@ import {
   type LongRunningProcess,
 } from "./process.js";
 
-// Android emulator lifecycle. Discovery names an AVD; attachment must turn that into a booted adb serial. Booting is
-// explicit and only happens when the caller asked for it, and the runtime records whether it booted the emulator so it
-// can shut down only what it started and never a device the user was already running.
+// Resolve AVD names to adb serials. Booting is explicit, and cancellation stops only the emulator this call started.
 
 export interface AndroidOptions {
   androidSdkRoot?: string;
@@ -40,6 +39,14 @@ export function resolveAndroidSdkRoot(
   const home = options.home ?? homedir();
   const configured = options.root ?? (env["ANDROID_HOME"] || env["ANDROID_SDK_ROOT"]);
   if (configured) return configured;
+  return defaultSdkRoot(platform, env, home);
+}
+
+function defaultSdkRoot(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  home: string,
+): string | undefined {
   if (platform === "darwin") return posix.join(home, "Library", "Android", "sdk");
   if (platform === "linux") return posix.join(home, "Android", "Sdk");
   if (platform === "win32")
@@ -94,12 +101,9 @@ async function resolveRunningSerial(
   const timeoutMs = options.timeoutMs ?? 20_000;
   const adb = androidToolPath("adb", options.androidSdkRoot);
   const devices = await run({ command: adb, args: ["devices"], timeoutMs });
-  const serials = devices.stdout
-    .split("\n")
-    .slice(1)
-    .map((line) => line.trim().split(/\s+/u))
-    .filter(([serial, state]) => serial?.startsWith("emulator-") && state === "device")
-    .map(([serial]) => serial);
+  const serials = parseAdbDevices(devices.stdout)
+    .filter((device) => device.serial.startsWith("emulator-") && device.state === "device")
+    .map((device) => device.serial);
   for (const serial of serials) {
     if (expectedSerial && serial !== expectedSerial) continue;
     const name = await run({
@@ -120,10 +124,15 @@ export async function ensureBooted(
     run?: typeof runCommand;
     spawn?: typeof spawnProcess;
     pollIntervalMs?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<BootedDevice> {
   const run = dependencies.run ?? runCommand;
-  const existing = await resolveRunningSerial(options, avdName, run);
+  dependencies.signal?.throwIfAborted();
+  const existing = await resolveRunningSerial(options, avdName, (spec) =>
+    run({ ...spec, signal: dependencies.signal }),
+  );
+  dependencies.signal?.throwIfAborted();
   if (existing) return { serial: existing, bootedByUs: false };
   if (!bootIntent) {
     throw deviceError(
@@ -134,9 +143,14 @@ export async function ensureBooted(
   const bootTimeoutMs = options.timeoutMs ?? 180_000;
   const report = await consoleReport();
   const abort = new AbortController();
+  const signal = dependencies.signal
+    ? AbortSignal.any([abort.signal, dependencies.signal])
+    : abort.signal;
+  const bootRun: typeof runCommand = (spec) => run({ ...spec, signal });
   let child: LongRunningProcess | undefined;
   let stderr = "";
   try {
+    signal.throwIfAborted();
     child = (dependencies.spawn ?? spawnProcess)({
       command: androidToolPath("emulator", options.androidSdkRoot),
       args: ["-avd", avdName, "-no-window", "-no-boot-anim", "-report-console", report.address],
@@ -158,11 +172,11 @@ export async function ensureBooted(
       const serial = await poll(
         () =>
           report.serial
-            ? resolveRunningSerial(options, avdName, run, report.serial)
+            ? resolveRunningSerial(options, avdName, bootRun, report.serial)
             : Promise.resolve(null),
         (value) => value !== null,
         bootTimeoutMs,
-        abort.signal,
+        signal,
         dependencies.pollIntervalMs,
       );
       if (!serial)
@@ -171,8 +185,8 @@ export async function ensureBooted(
         options,
         serial,
         bootTimeoutMs,
-        run,
-        abort.signal,
+        bootRun,
+        signal,
         dependencies.pollIntervalMs,
       );
       return { serial, bootedByUs: true, process };
@@ -290,7 +304,9 @@ async function poll<T>(
   intervalMs = 2_000,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
+  signal?.throwIfAborted();
   let value = await produce();
+  signal?.throwIfAborted();
   while (!done(value) && Date.now() < deadline) {
     signal?.throwIfAborted();
     await new Promise<void>((resolve, reject) => {
@@ -309,6 +325,7 @@ async function poll<T>(
     });
     signal?.throwIfAborted();
     value = await produce();
+    signal?.throwIfAborted();
   }
   return value;
 }

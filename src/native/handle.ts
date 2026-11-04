@@ -2,10 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Device } from "../rpc.js";
 import { deviceError } from "./errors.js";
 
-// The handle and reference registry. A handle binds an opaque token to one platform, device, and connection
-// generation; a snapshot reference additionally carries the revision it came from. The registry is the single authority
-// that decides whether a handle is still attached and whether a reference is still valid, so a stale generation or an
-// out-of-date snapshot reference is rejected before any native command is dispatched.
+// Bind handles to devices and connection generations. Snapshot revisions prevent input against stale screen contents.
 
 interface ActiveHandle {
   handle: Device.DeviceHandle;
@@ -38,14 +35,7 @@ export class HandleRegistry {
 
   // Resolve an attached handle, or reject with `detached` when its token or generation no longer matches.
   require(handle: Device.DeviceHandle): Device.DeviceHandle {
-    const entry = this.active.get(handle.token);
-    if (!entry || entry.handle.generation !== handle.generation) {
-      throw deviceError(
-        "detached",
-        "This device handle is no longer attached; open the device again.",
-      );
-    }
-    return entry.handle;
+    return this.entry(handle).handle;
   }
 
   // The current snapshot revision for an attached handle.
@@ -66,13 +56,12 @@ export class HandleRegistry {
   }
 
   // Resolve a snapshot reference to its element ref, rejecting a reference whose attachment is gone (`detached`) or
-  // whose revision a newer snapshot, relaunch, or reconnect has superseded (`stale-reference`). When a `handle` is
-  // passed, the reference must also belong to exactly that attachment, so an element ref captured on one device can
-  // never be dispatched against another device the caller named.
+  // whose revision has been superseded (`stale-reference`). A supplied handle must name that same attachment.
   resolveReference(
     reference: Device.SnapshotReference,
     handle?: Device.DeviceHandle,
   ): Device.ElementRef {
+    if (handle) this.require(handle);
     if (
       handle &&
       (reference.token !== handle.token || reference.generation !== handle.generation)
@@ -105,12 +94,14 @@ export class HandleRegistry {
 
   // Release an attachment. A released token can never be revived; a new connection requires a new handle.
   release(handle: Device.DeviceHandle): void {
+    if (!this.active.has(handle.token)) return;
+    this.require(handle);
     this.active.delete(handle.token);
   }
 
   private entry(handle: Device.DeviceHandle): ActiveHandle {
     const entry = this.active.get(handle.token);
-    if (!entry || entry.handle.generation !== handle.generation) {
+    if (!entry || !Device.sameHandle(entry.handle, handle)) {
       throw deviceError(
         "detached",
         "This device handle is no longer attached; open the device again.",

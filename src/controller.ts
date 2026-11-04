@@ -30,6 +30,9 @@ export function createDeviceController(runtime: DeviceRuntime) {
   const reservations = new Set<string>();
   const rollbacks = new Map<string, OpenResult>();
   const transitions = new Map<string, Promise<void>>();
+  const opening = new Map<string, AbortController>();
+  const preparing = new Map<Promise<void>, { session: string; device: string }>();
+  const retiring = new Map<Attachment, { session: string; pending: Promise<void> }>();
   let disposed = false;
 
   const sessionKey = (caller: DeviceCaller) => JSON.stringify([caller.serverID, caller.sessionID]);
@@ -55,12 +58,7 @@ export function createDeviceController(runtime: DeviceRuntime) {
   ) => {
     const entry = requireSession(caller);
     const expected = entry.device.handle;
-    if (
-      expected.token !== handle.token ||
-      expected.generation !== handle.generation ||
-      expected.platform !== handle.platform ||
-      expected.deviceId !== handle.deviceId
-    )
+    if (!Device.sameHandle(expected, handle))
       throw deviceError(
         "permission-denied",
         "This handle does not belong to this session's attached device.",
@@ -83,6 +81,36 @@ export function createDeviceController(runtime: DeviceRuntime) {
     });
     return result;
   };
+  const prepare = <Result>(
+    caller: DeviceCaller,
+    input: OpenInput,
+    signal: AbortSignal | undefined,
+    action: (signal: AbortSignal) => Promise<Result>,
+  ) => {
+    const session = sessionKey(caller);
+    const device = deviceKey(input.platform, input.deviceId);
+    opening.get(session)?.abort();
+    const abort = new AbortController();
+    const combined = AbortSignal.any([abort.signal, ...(signal ? [signal] : [])]);
+    opening.set(session, abort);
+    const cleanup = [...preparing]
+      .filter(([, previous]) => previous.session === session && previous.device === device)
+      .map(([pending]) => pending);
+    const result = Promise.all(cleanup).then(() => {
+      combined.throwIfAborted();
+      return action(combined);
+    });
+    const pending = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    preparing.set(pending, { session, device });
+    void pending.then(() => {
+      preparing.delete(pending);
+      if (opening.get(session) === abort) opening.delete(session);
+    });
+    return result;
+  };
   const forget = (entry: Attachment) => {
     devices.forEach((value, key) => {
       if (value === entry) devices.delete(key);
@@ -99,6 +127,25 @@ export function createDeviceController(runtime: DeviceRuntime) {
       entry.closing = false;
       throw error;
     }
+  };
+  const retire = (caller: DeviceCaller, entry: Attachment) => {
+    const pending = release(entry).then(
+      () => {
+        retiring.delete(entry);
+      },
+      // Keep ownership until reopening or disposal retries failed cleanup.
+      () => undefined,
+    );
+    retiring.set(entry, { session: sessionKey(caller), pending });
+  };
+  const finishRetirement = async (caller: DeviceCaller, input: OpenInput) => {
+    const entry = devices.get(deviceKey(input.platform, input.deviceId));
+    const cleanup = entry && retiring.get(entry);
+    if (!entry || !cleanup || cleanup.session !== sessionKey(caller)) return;
+    await cleanup.pending;
+    if (!retiring.has(entry)) return;
+    await release(entry);
+    retiring.delete(entry);
   };
   const rollback = async (key: string, device: OpenResult) => {
     rollbacks.set(key, device);
@@ -118,7 +165,7 @@ export function createDeviceController(runtime: DeviceRuntime) {
       throw deviceError("device-busy", "This device is controlled by another session.");
     reservations.add(key);
     try {
-      const device = rollbacks.get(key) ?? (await runtime.open(input));
+      const device = rollbacks.get(key) ?? (await runtime.open(input, signal));
       const physicalKey = deviceKey(device.handle.platform, device.handle.deviceId);
       if (devices.has(physicalKey)) {
         await runtime.close({ handle: device.handle });
@@ -199,17 +246,21 @@ export function createDeviceController(runtime: DeviceRuntime) {
   };
 
   return {
-    async list(platform?: Device.Platform, caller?: DeviceCaller) {
+    async list(platform?: Device.Platform, caller?: DeviceCaller, signal?: AbortSignal) {
       if (disposed) throw deviceError("detached", "The device controller has stopped.");
       const own = caller ? sessions.get(sessionKey(caller)) : undefined;
-      return (await runtime.list(platform)).map((device) => {
+      const listed = await runtime.list(platform, signal);
+      signal?.throwIfAborted();
+      return listed.map((device) => {
         const key = deviceKey(device.platform, device.id);
         const owner = devices.get(key);
         if (owner)
           return {
             ...device,
             ownership:
-              owner === own ? ("owned-by-this-host" as const) : ("owned-by-other" as const),
+              owner === own || (caller && retiring.get(owner)?.session === sessionKey(caller))
+                ? ("owned-by-this-host" as const)
+                : ("owned-by-other" as const),
           };
         return reservations.has(key) ? { ...device, ownership: "owned-by-other" as const } : device;
       });
@@ -224,29 +275,36 @@ export function createDeviceController(runtime: DeviceRuntime) {
       return report(entry);
     },
     async open(caller: DeviceCaller, input: OpenInput, origin: DeviceOrigin, signal?: AbortSignal) {
-      return transition(caller, async () => {
-        signal?.throwIfAborted();
-        if (disposed) throw deviceError("detached", "The device controller has stopped.");
-        const current = sessions.get(sessionKey(caller));
-        if (current && devices.get(deviceKey(input.platform, input.deviceId)) === current) {
-          requireHandle(caller, current.device.handle, origin);
-          return report(current);
-        }
-        if (origin === "agent")
-          throw deviceError(
-            "permission-denied",
-            "Attach a device and enable agent access in the Device panel first.",
-          );
+      signal?.throwIfAborted();
+      if (disposed) throw deviceError("detached", "The device controller has stopped.");
+      const current = sessions.get(sessionKey(caller));
+      if (current && devices.get(deviceKey(input.platform, input.deviceId)) === current) {
+        requireHandle(caller, current.device.handle, origin);
+        if (origin === "manual") opening.get(sessionKey(caller))?.abort();
+        return report(current);
+      }
+      if (origin === "agent")
+        throw deviceError(
+          "permission-denied",
+          "Attach a device and enable agent access in the Device panel first.",
+        );
+      return prepare(caller, input, signal, async (signal) => {
+        await finishRetirement(caller, input);
+        signal.throwIfAborted();
         const entry = await acquire(input, signal);
         try {
-          if (current) await release(current, undefined, signal);
+          return await transition(caller, async () => {
+            signal.throwIfAborted();
+            const current = sessions.get(sessionKey(caller));
+            entry.agentAccess = current?.agentAccess ?? true;
+            sessions.set(sessionKey(caller), entry);
+            if (current) retire(caller, current);
+            return report(entry);
+          });
         } catch (error) {
           await discard(entry);
           throw error;
         }
-        entry.agentAccess = current?.agentAccess ?? true;
-        sessions.set(sessionKey(caller), entry);
-        return report(entry);
       });
     },
     async stream(caller: DeviceCaller, handle: Device.DeviceHandle) {
@@ -281,6 +339,9 @@ export function createDeviceController(runtime: DeviceRuntime) {
       origin: DeviceOrigin,
       signal?: AbortSignal,
     ) {
+      signal?.throwIfAborted();
+      requireHandle(caller, input.handle, origin);
+      opening.get(sessionKey(caller))?.abort();
       return transition(caller, async () => {
         signal?.throwIfAborted();
         const entry = requireHandle(caller, input.handle, origin);
@@ -289,6 +350,7 @@ export function createDeviceController(runtime: DeviceRuntime) {
       });
     },
     async detach(caller: DeviceCaller) {
+      opening.get(sessionKey(caller))?.abort();
       return transition(caller, async () => {
         const entry = sessions.get(sessionKey(caller));
         if (!entry) return;
@@ -298,7 +360,12 @@ export function createDeviceController(runtime: DeviceRuntime) {
     },
     async dispose() {
       disposed = true;
+      for (const abort of opening.values()) abort.abort();
+      await Promise.all(preparing.keys());
       await Promise.all(transitions.values());
+      await Promise.all([...retiring.values()].map((cleanup) => cleanup.pending));
+      await Promise.allSettled([...retiring.keys()].map((entry) => release(entry)));
+      retiring.clear();
       await Promise.all([...new Set(devices.values())].map((entry) => entry.pending));
       sessions.clear();
       devices.clear();

@@ -10,6 +10,7 @@ import { runCommand, type CommandResult } from "./process.js";
 
 export interface SimulatorOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface BootedSimulator {
@@ -66,7 +67,12 @@ export async function iosDevices(
   options: SimulatorOptions = {},
   run = runCommand,
 ): Promise<Device.DeviceInfo[]> {
-  const result = await simctl(run, ["list", "devices", "available", "-j"], options.timeoutMs);
+  const result = await simctl(
+    run,
+    ["list", "devices", "available", "-j"],
+    options.timeoutMs,
+    options.signal,
+  );
   if (result.code !== 0)
     throw deviceError(
       "missing-prerequisite",
@@ -83,35 +89,53 @@ export async function ensureSimulatorBooted(
   bootIntent: boolean,
   run = runCommand,
 ): Promise<BootedSimulator> {
-  const device = (await iosDevices(options, run)).find((entry) => entry.id === udid);
-  if (!device) throw deviceError("not-found", `The simulator "${udid}" was not found.`);
+  const listed = await iosDevices(options, run);
+  options.signal?.throwIfAborted();
+  const device = simulatorForBoot(
+    listed.find((entry) => entry.id === udid),
+    udid,
+    bootIntent,
+  );
   if (device.state === "booted") return { deviceId: udid, bootedByUs: false };
-  if (device.state === "unavailable")
-    throw deviceError("unsupported", `The simulator "${device.name}" is unavailable.`);
-  if (device.state === "shutdown" && !bootIntent)
-    throw deviceError(
-      "not-found",
-      `The simulator "${device.name}" is not booted; open it with boot enabled.`,
-    );
 
   const bootTimeoutMs = options.timeoutMs ?? 180_000;
   let bootedByUs = false;
   if (device.state === "shutdown") {
+    // Finish the boot command so cancellation knows whether this call owns the simulator.
     const boot = await simctl(run, ["boot", udid], bootTimeoutMs);
     if (boot.code !== 0 && !ALREADY_BOOTED.test(boot.stderr))
       throw simctlFailure("Booting the simulator", boot);
     bootedByUs = boot.code === 0;
   }
   try {
+    options.signal?.throwIfAborted();
     requireSuccess(
       "Waiting for the simulator to boot",
-      await simctl(run, ["bootstatus", udid, "-b"], bootTimeoutMs),
+      await simctl(run, ["bootstatus", udid, "-b"], bootTimeoutMs, options.signal),
     );
+    options.signal?.throwIfAborted();
   } catch (error) {
-    if (bootedByUs) await shutdownSimulator(options, udid, run).catch(() => undefined);
+    if (bootedByUs)
+      await shutdownSimulator({ timeoutMs: options.timeoutMs }, udid, run).catch(() => undefined);
     throw error;
   }
   return { deviceId: udid, bootedByUs };
+}
+
+function simulatorForBoot(
+  device: Device.DeviceInfo | undefined,
+  udid: string,
+  boot: boolean,
+): Device.DeviceInfo {
+  if (!device) throw deviceError("not-found", `The simulator "${udid}" was not found.`);
+  if (device.state === "unavailable")
+    throw deviceError("unsupported", `The simulator "${device.name}" is unavailable.`);
+  if (device.state === "shutdown" && !boot)
+    throw deviceError(
+      "not-found",
+      `The simulator "${device.name}" is not booted; open it with boot enabled.`,
+    );
+  return device;
 }
 
 // Shut down a simulator this runtime booted. An already shut down simulator is not an error.
@@ -125,8 +149,18 @@ export async function shutdownSimulator(
   requireSuccess("Shutting down the simulator", result, true);
 }
 
-function simctl(run: typeof runCommand, args: readonly string[], timeoutMs = 20_000) {
-  return run({ command: "xcrun", args: ["simctl", ...args], timeoutMs });
+function simctl(
+  run: typeof runCommand,
+  args: readonly string[],
+  timeoutMs = 20_000,
+  signal?: AbortSignal,
+) {
+  return run({
+    command: "xcrun",
+    args: ["simctl", ...args],
+    timeoutMs,
+    ...(signal ? { signal } : {}),
+  });
 }
 
 function requireSuccess(action: string, result: CommandResult, mayHaveExecuted = false) {

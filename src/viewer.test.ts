@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import {
   annexBCodec,
   contentPoint,
@@ -12,41 +12,174 @@ import {
 
 const annexB = new Uint8Array([0, 0, 0, 1, 0x67, 0x64, 0, 0x29, 0, 0, 1, 0x65, 0x88]);
 
-test("destroying a viewer clears the previous device canvas dimensions", () => {
-  const original = Object.getOwnPropertyDescriptor(globalThis, "document");
+function h264Fixture() {
+  jest.useFakeTimers();
   const listeners = new Set<EventListener>();
-  Object.defineProperty(globalThis, "document", {
-    configurable: true,
-    value: {
+  const checks: Array<ReturnType<typeof Promise.withResolvers<VideoDecoderSupport>>> = [];
+  class Socket extends EventTarget {
+    static instance: Socket;
+    static OPEN = 1;
+    readyState = 1;
+    closed = false;
+    binaryType = "";
+    constructor() {
+      super();
+      Socket.instance = this;
+    }
+    send() {}
+    close() {
+      this.closed = true;
+    }
+    emit(type: string, properties: object = {}) {
+      this.dispatchEvent(Object.assign(new Event(type), properties));
+    }
+  }
+  class Decoder {
+    static isConfigSupported() {
+      const check = Promise.withResolvers<VideoDecoderSupport>();
+      checks.push(check);
+      return check.promise;
+    }
+    state = "unconfigured";
+    decodeQueueSize = 0;
+    constructor(private readonly callbacks: VideoDecoderInit) {}
+    configure() {
+      this.state = "configured";
+    }
+    decode() {
+      this.callbacks.output({ displayWidth: 100, displayHeight: 200, close() {} } as VideoFrame);
+    }
+    close() {
+      this.state = "closed";
+    }
+  }
+  const globals = {
+    document: {
+      visibilityState: "visible",
       addEventListener: (_type: string, listener: EventListener) => listeners.add(listener),
       removeEventListener: (_type: string, listener: EventListener) => listeners.delete(listener),
     },
+    WebSocket: Socket,
+    VideoDecoder: Decoder,
+    EncodedVideoChunk: class {},
+  };
+  const originals = new Map(
+    Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+  );
+  for (const [key, value] of Object.entries(globals))
+    Object.defineProperty(globalThis, key, { configurable: true, value });
+  const states: string[] = [];
+  const errors: string[] = [];
+  const canvas = {
+    width: 0,
+    height: 0,
+    getContext: () => ({ drawImage() {} }),
+  } as unknown as HTMLCanvasElement;
+  const viewer = createViewer({
+    canvas,
+    stream: {
+      platform: "android",
+      deviceId: "phone",
+      baseUrl: "http://127.0.0.1:3400",
+      token: "private-token",
+      protocol: "h264",
+      loopback: true,
+    },
+    onState: (state) => states.push(state),
+    onError: (message) => errors.push(message),
   });
+  viewer.active(true);
+  return {
+    viewer,
+    states,
+    errors,
+    canvas,
+    listeners,
+    checks,
+    socket: Socket.instance,
+    restore() {
+      viewer.destroy();
+      jest.useRealTimers();
+      for (const [key, original] of originals) {
+        if (original) Object.defineProperty(globalThis, key, original);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    },
+  };
+}
+
+test("unexpected Android video closure is visible instead of a silently blank panel", () => {
+  const item = h264Fixture();
   try {
-    const canvas = { width: 100, height: 200 } as HTMLCanvasElement;
-    const states: string[] = [];
-    const viewer = createViewer({
-      canvas,
-      stream: {
-        platform: "android",
-        deviceId: "device-a",
-        baseUrl: "http://127.0.0.1:3400",
-        token: "private",
-        protocol: "h264",
-        loopback: true,
-      },
-      onState: (state) => states.push(state),
-      onError: () => undefined,
-    });
-    expect(listeners.size).toBe(1);
-    viewer.destroy();
-    expect(canvas.width).toBe(0);
-    expect(canvas.height).toBe(0);
-    expect(states).toEqual(["idle"]);
-    expect(listeners.size).toBe(0);
+    item.socket.emit("close", { code: 1006 });
+    expect(item.states).toEqual(["connecting", "paused"]);
+    expect(item.errors[0]).toContain("connection closed (code 1006)");
+    expect(jest.getTimerCount()).toBe(0);
   } finally {
-    if (original) Object.defineProperty(globalThis, "document", original);
-    else Reflect.deleteProperty(globalThis, "document");
+    item.restore();
+  }
+});
+
+test("Android video startup has a deadline and stops failed connections", () => {
+  const item = h264Fixture();
+  try {
+    jest.advanceTimersByTime(15_000);
+    expect(item.errors[0]).toContain("within 15 seconds");
+    expect(item.socket.closed).toBe(true);
+    expect(item.states.at(-1)).toBe("paused");
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    item.restore();
+  }
+});
+
+test("Android backend errors are shown once and redact the stream token", () => {
+  const item = h264Fixture();
+  try {
+    item.socket.emit("message", {
+      data: JSON.stringify({ ok: false, error: "capture failed private-token" }),
+    });
+    item.socket.emit("close", { code: 1006 });
+    expect(item.errors).toEqual(["Android video failed: capture failed [redacted]"]);
+    expect(item.socket.closed).toBe(true);
+  } finally {
+    item.restore();
+  }
+});
+
+test("Android ignores stale decoder checks, renders the current frame, and releases viewer resources", async () => {
+  const item = h264Fixture();
+  try {
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.socket.emit("message", {
+      data: JSON.stringify({ type: "video-session", size: { width: 100, height: 200 } }),
+    });
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.checks[0].reject(new Error("obsolete codec check"));
+    item.checks[1].resolve({ supported: true });
+    await Promise.resolve();
+    expect(item.states).toEqual(["connecting", "playing"]);
+    expect(item.canvas.width).toBe(100);
+    expect(item.canvas.height).toBe(200);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(item.errors).toEqual([]);
+    expect(item.listeners.size).toBe(1);
+    item.socket.emit("message", {
+      data: JSON.stringify({ type: "video-session", size: { width: 100, height: 200 } }),
+    });
+    expect(jest.getTimerCount()).toBe(1);
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.checks[2].resolve({ supported: true });
+    await Promise.resolve();
+    expect(jest.getTimerCount()).toBe(0);
+    item.viewer.destroy();
+    expect(item.canvas.width).toBe(0);
+    expect(item.canvas.height).toBe(0);
+    expect(item.listeners.size).toBe(0);
+    item.socket.emit("close", { code: 1006 });
+    expect(item.errors).toEqual([]);
+  } finally {
+    item.restore();
   }
 });
 
@@ -80,6 +213,7 @@ describe("parseFramePacket", () => {
     expect(packet).toEqual({
       bytes: data.subarray(16),
       key: true,
+      codec: "avc1.640029",
       timestamp: 123_456,
       serverTimestamp: undefined,
     });
@@ -91,11 +225,10 @@ describe("parseFramePacket", () => {
     expect(packet).toEqual({
       bytes: data.subarray(24),
       key: true,
+      codec: "avc1.640029",
       timestamp: 222,
       serverTimestamp: 1_735_689_600_123,
     });
-    expect(packet?.width).toBeUndefined();
-    expect(packet?.height).toBeUndefined();
   });
 
   test.each([

@@ -198,6 +198,9 @@ describe("H.264 proxy (Android)", () => {
       socket.on("close", resolveClosed);
       socket.send(JSON.stringify({ type: "video-session", size: { width: 1080, height: 2400 } }));
       socket.send(Buffer.from([0x00, 0x00, 0x00, 0x01, 0x67, 0x42]), { binary: true });
+      socket.send(
+        JSON.stringify({ type: "diagnostic", message: `fixture diagnostic ${HUB_TOKEN}` }),
+      );
     });
     teardown.push(
       () =>
@@ -224,7 +227,7 @@ describe("H.264 proxy (Android)", () => {
       "other",
       `opencode-device.${proxy.descriptor.token}`,
     ]);
-    const messages = await collect(client, 2);
+    const messages = await collect(client, 3);
 
     expect(typeof messages[0]).toBe("string");
     expect(JSON.parse(messages[0] as string)).toEqual({
@@ -232,6 +235,10 @@ describe("H.264 proxy (Android)", () => {
       size: { width: 1080, height: 2400 },
     });
     expect(messages[1]).toEqual(Buffer.from([0x00, 0x00, 0x00, 0x01, 0x67, 0x42]));
+    expect(JSON.parse(messages[2] as string)).toEqual({
+      type: "diagnostic",
+      message: "fixture diagnostic [redacted]",
+    });
     expect(hub.lastUrl()).toBe("/vendor/serve-emu/ws?device=emulator-5554&video=1&frame-meta=1");
     client.close();
     await hub.clientClosed;

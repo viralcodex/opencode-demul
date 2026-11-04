@@ -3,6 +3,7 @@ import { MenuItem, Panel, Plugin, usePanel } from "@opencode/plugin/gui";
 import { DeviceBridge } from "./bridge.js";
 import { DeviceIpc } from "./ipc.js";
 import { Device } from "./rpc.js";
+import { createLatestRequest } from "./latest-request.js";
 import {
   contentPoint,
   createViewer,
@@ -97,16 +98,19 @@ export default Plugin.define({
       const [devices, setDevices] = createSignal<readonly Device.DeviceInfo[]>([]);
       const [selectedDevice, setSelectedDevice] = createSignal("");
       const [selectedPlatform, setSelectedPlatform] = createSignal<Device.Platform>("android");
+      let platformChosen = false;
       const platformDevices = createMemo(() =>
         devices().filter((device) => device.platform === selectedPlatform()),
       );
-      const [busy, setBusy] = createSignal<string>();
+      const [opening, setOpening] = createSignal(false);
+      const [listing, setListing] = createSignal(false);
       const [error, setError] = createSignal<string>();
       const [connectionError, setConnectionError] = createSignal<string>();
       const [viewerState, setViewerState] = createSignal<ViewerState>("idle");
       const [renderedToken, setRenderedToken] = createSignal<string>();
       const [viewer, setViewer] = createSignal<ReturnType<typeof createViewer>>();
       const [canvas, setCanvas] = createSignal<HTMLCanvasElement>();
+      const [viewerRevision, setViewerRevision] = createSignal(0);
       const scope = () => ({
         sessionID: props.sessionID,
         serverID: props.serverID,
@@ -117,34 +121,42 @@ export default Plugin.define({
         undefined;
       const attachmentToken = createMemo(() => attachment()?.handle.token);
       createEffect(() => {
-        const current = attachment();
+        attachmentToken();
+        if (untrack(opening)) return;
+        const current = untrack(attachment);
         if (!current) return;
         setSelectedPlatform(current.handle.platform);
         setSelectedDevice(current.selection?.deviceId ?? current.handle.deviceId);
       });
-      const startupMessage = createMemo(() => {
-        if (connectionError() || error()) return;
-        if (busy() === "list") return "Finding devices...";
-        if (!busy() && !attachment() && devices().length === 0)
+      const discoveryMessage = () => {
+        if (listing() && !opening() && !attachment()) return "Finding devices...";
+        if (!listing() && !opening() && !attachment() && devices().length === 0)
           return "No emulators or simulators found.";
-        if (busy() === "open") {
-          return devices().find((device) => device.id === selectedDevice())?.state === "shutdown"
-            ? "Booting up device..."
-            : "Connecting to device...";
-        }
+      };
+      const openingMessage = () => {
+        if (!opening()) return;
+        return devices().find((device) => device.id === selectedDevice())?.state === "shutdown"
+          ? "Booting up device..."
+          : "Connecting to device...";
+      };
+      const screenMessage = () => {
         if (
           attachment()?.capabilities.supported.includes("stream") &&
           (viewerState() === "idle" || viewerState() === "connecting")
         ) {
           return "Almost done, preparing the screen...";
         }
+      };
+      const startupMessage = createMemo(() => {
+        if (connectionError() || error()) return;
+        return openingMessage() ?? discoveryMessage() ?? screenMessage();
       });
       let pointerStart:
         | { point: Device.LogicalPoint; frame: ScreenFrame; pointerId: number }
         | undefined;
-      const currentFrame = () => {
+      const displayedFrame = () => {
         const surface = canvas();
-        if (!surface || busy() === "open" || busy() === "close") return;
+        if (!surface) return;
         return screenFrame(attachmentToken(), renderedToken(), viewerState(), surface);
       };
 
@@ -167,82 +179,117 @@ export default Plugin.define({
           });
       });
 
-      const outcome = async (name: string, action: () => Promise<DeviceBridge.Outcome>) => {
-        setBusy(name);
+      const value = (result: DeviceBridge.Outcome) => {
+        if (result.type === "failure")
+          throw new Error(`${result.error.code}: ${result.error.message}`);
+        return result.value;
+      };
+      const outcome = async (action: () => Promise<DeviceBridge.Outcome>) => {
         setError(undefined);
         try {
-          const result = await action();
-          if (result.type === "failure") {
-            setError(`${result.error.code}: ${result.error.message}`);
-            return;
-          }
-          return result.value;
+          return value(await action());
         } catch (cause) {
           setError(message(cause));
-        } finally {
-          setBusy(undefined);
         }
       };
+      const restoreSelection = () => {
+        const current = attachment();
+        setSelectedDevice(current?.selection?.deviceId ?? current?.handle.deviceId ?? "");
+        if (current) setSelectedPlatform(current.handle.platform);
+      };
+      const selection = createLatestRequest({
+        pending: setOpening,
+        error(cause) {
+          setError(message(cause));
+          restoreSelection();
+        },
+      });
+      const discovery = createLatestRequest({
+        pending: setListing,
+        error: (cause) => setError(message(cause)),
+      });
+      onCleanup(() => {
+        selection.cancel();
+        discovery.cancel();
+      });
 
       const refresh = async () => {
-        const value = await outcome("list", () =>
-          bridge.list({ serverID: props.serverID, sessionID: props.sessionID }),
+        setError(undefined);
+        const input = { serverID: props.serverID, sessionID: props.sessionID };
+        await discovery.run(
+          (signal) => bridge.list(input, { signal }),
+          (result) => {
+            const listed = value(result);
+            if (listed.type !== "devices") return;
+            setDevices(listed.devices);
+            if (opening()) return;
+            if (attachment()) {
+              if (viewerState() === "paused") setViewerRevision((revision) => revision + 1);
+              return;
+            }
+            const first =
+              firstDevice(platformDevices()) ??
+              (!platformChosen && !selectedDevice() ? firstDevice(listed.devices) : undefined);
+            if (first) {
+              setSelectedPlatform(first.platform);
+              void selectDevice(first.id);
+            }
+          },
         );
-        if (value?.type !== "devices") return;
-        setDevices(value.devices);
-        const current = attachment();
-        if (current) {
-          setSelectedPlatform(current.handle.platform);
-          setSelectedDevice(current.selection?.deviceId ?? current.handle.deviceId);
-          return;
-        }
-        const first =
-          firstDevice(platformDevices()) ??
-          (!selectedDevice() ? firstDevice(value.devices) : undefined);
-        if (first) {
-          setSelectedPlatform(first.platform);
-          await selectDevice(first.id);
-        }
       };
 
       const selectPlatform = async (platform: Device.Platform) => {
+        platformChosen = true;
         if (platform === selectedPlatform()) return;
+        selection.cancel();
         setSelectedPlatform(platform);
         const first =
           platformDevices().find((device) => device.id === selectedDevice()) ??
           firstDevice(platformDevices());
         if (first) await selectDevice(first.id);
+        else setSelectedDevice("");
       };
 
       const selectDevice = async (id: string) => {
+        if (opening() && id === selectedDevice()) return;
         setSelectedDevice(id);
-        const value = await outcome("open", async () => {
-          await connect(scope());
-          const device = devices().find((item) => item.id === id);
-          if (!device) throw new Error("The selected device is no longer available.");
-          return bridge.manual({
-            scope: scope(),
-            operation: {
-              type: "open",
-              platform: device.platform,
-              deviceId: device.id,
-              boot: device.state === "shutdown",
-            },
-          });
-        });
-        if (!value) {
-          const current = attachment();
-          setSelectedDevice(current?.selection?.deviceId ?? current?.handle.deviceId ?? "");
-          if (current) setSelectedPlatform(current.handle.platform);
-        }
+        setError(undefined);
+        const target = scope();
+        await selection.run(
+          async (signal) => {
+            const device = devices().find((item) => item.id === id);
+            if (!device) throw new Error("The selected device is no longer available.");
+            await connect(target);
+            signal.throwIfAborted();
+            return bridge.manual(
+              {
+                scope: target,
+                operation: {
+                  type: "open",
+                  platform: device.platform,
+                  deviceId: device.id,
+                  boot: device.state === "shutdown",
+                },
+              },
+              { signal },
+            );
+          },
+          (result) => {
+            if (result.type === "failure" && result.error.code === "detached") restoreSelection();
+            else value(result);
+          },
+        );
       };
 
       createEffect(() => {
         scope();
+        selection.cancel();
+        discovery.cancel();
         void refresh();
       });
 
       createEffect(() => {
+        viewerRevision();
         const token = attachmentToken();
         const surface = canvas();
         const current = untrack(attachment);
@@ -260,36 +307,43 @@ export default Plugin.define({
           !current.capabilities.supported.includes("stream")
         )
           return;
+        setError(undefined);
         const abort = new AbortController();
-        void bridge
-          .stream({ scope: scope(), handle: current.handle }, { signal: abort.signal })
-          .then(
-            (result) => {
-              if (abort.signal.aborted) return;
-              if (result.type === "failure") {
-                setError(`${result.error.code}: ${result.error.message}`);
-                return;
-              }
-              setViewer(
-                createViewer({
-                  canvas: surface,
-                  stream: result.stream,
-                  onState: (state) => {
-                    if (abort.signal.aborted || attachmentToken() !== token) return;
-                    setRenderedToken(state === "playing" ? token : undefined);
-                    setViewerState(state);
-                  },
-                  onError: setError,
-                }),
-              );
-            },
-            (cause) => {
-              if (!abort.signal.aborted) setError(message(cause));
-            },
-          );
+        let currentViewer: ReturnType<typeof createViewer> | undefined;
+        const isCurrent = () => !abort.signal.aborted && attachmentToken() === token;
+        const fail = (cause: unknown) => {
+          if (!isCurrent()) return;
+          setViewerState("paused");
+          setError(message(cause));
+        };
+        const start = async () => {
+          try {
+            const result = await bridge.stream(
+              { scope: scope(), handle: current.handle },
+              { signal: abort.signal },
+            );
+            if (!isCurrent()) return;
+            if (result.type === "failure")
+              return fail(`${result.error.code}: ${result.error.message}`);
+            currentViewer = createViewer({
+              canvas: surface,
+              stream: result.stream,
+              onState: (state) => {
+                if (!isCurrent()) return;
+                setRenderedToken(state === "playing" ? token : undefined);
+                setViewerState(state);
+              },
+              onError: fail,
+            });
+            setViewer(currentViewer);
+          } catch (cause) {
+            fail(cause);
+          }
+        };
+        void start();
         onCleanup(() => {
           abort.abort();
-          viewer()?.destroy();
+          currentViewer?.destroy();
           setViewer(undefined);
         });
       });
@@ -297,7 +351,7 @@ export default Plugin.define({
       createEffect(() => viewer()?.active(panel.visible()));
 
       const manual = (operation: DeviceBridge.Operation) =>
-        outcome(operation.type, () => bridge.manual({ scope: scope(), operation }));
+        outcome(() => bridge.manual({ scope: scope(), operation }));
       const point = (event: PointerEvent) => {
         const surface = canvas();
         if (!surface) return;
@@ -308,7 +362,7 @@ export default Plugin.define({
       };
       const pointerDown = (event: PointerEvent) => {
         pointerStart = undefined;
-        const frame = currentFrame();
+        const frame = displayedFrame();
         if (event.button !== 0 || !frame) return;
         const start = point(event);
         const surface = canvas();
@@ -331,7 +385,7 @@ export default Plugin.define({
           !to ||
           !surface ||
           start.pointerId !== event.pointerId ||
-          !sameScreenFrame(start.frame, currentFrame())
+          !sameScreenFrame(start.frame, displayedFrame())
         )
           return;
         const viewport = { width: surface.width, height: surface.height };
@@ -349,7 +403,7 @@ export default Plugin.define({
             <canvas
               ref={setCanvas}
               aria-label="Live device screen"
-              style={{ visibility: currentFrame() ? "visible" : "hidden" }}
+              style={{ visibility: displayedFrame() ? "visible" : "hidden" }}
               tabIndex={0}
               onPointerDown={pointerDown}
               onPointerUp={pointerUp}
@@ -358,6 +412,7 @@ export default Plugin.define({
             <Show when={startupMessage()}>
               <div
                 class="device-panel__viewer-state"
+                classList={{ "device-panel__viewer-state--pending": !!displayedFrame() }}
                 role="status"
                 aria-live="polite"
                 aria-atomic="true"
@@ -381,7 +436,6 @@ export default Plugin.define({
                     type="button"
                     class="device-panel__platform"
                     aria-pressed={selectedPlatform() === platform}
-                    disabled={!!busy()}
                     onClick={() => void selectPlatform(platform)}
                   >
                     {platform === "android" ? "Android" : "iOS"}
@@ -394,7 +448,7 @@ export default Plugin.define({
               aria-label="Device"
               value={platformDevices().find((device) => device.id === selectedDevice())?.id ?? ""}
               onChange={(event) => void selectDevice(event.currentTarget.value)}
-              disabled={!!busy() || platformDevices().length === 0}
+              disabled={platformDevices().length === 0}
             >
               <option value="" disabled>
                 {platformDevices().length ? "Select device" : "No devices"}
@@ -408,7 +462,7 @@ export default Plugin.define({
                 type="button"
                 class="device-panel__action"
                 aria-label="Refresh devices"
-                disabled={!!busy()}
+                aria-busy={listing()}
                 onClick={() => void refresh()}
               >
                 <ctx.ui.Icon name="refresh" size="small" />
@@ -425,9 +479,9 @@ export default Plugin.define({
                 label="Agent device access"
                 hideLabel
                 checked={attachment()?.agentAccess ?? false}
-                disabled={!attachment() || !!busy()}
+                disabled={!attachment()}
                 onChange={(enabled) =>
-                  void outcome("access", () => bridge.access({ scope: scope(), enabled }))
+                  void outcome(() => bridge.access({ scope: scope(), enabled }))
                 }
               />
             </ctx.ui.Tooltip>

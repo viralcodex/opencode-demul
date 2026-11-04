@@ -259,7 +259,9 @@ test("waitForScreen polls the authenticated config route until capture becomes r
     response.writeHead(requests.length <= 2 ? 404 : 200).end("{}");
   });
   const baseUrl = await listen(server);
-  await expect(waitForScreen(descriptor(baseUrl), 1_000, 5)).resolves.toBeUndefined();
+  await expect(
+    waitForScreen(descriptor(baseUrl), { timeoutMs: 1_000, intervalMs: 5 }),
+  ).resolves.toBeUndefined();
   expect(requests).toEqual(
     Array.from({ length: 3 }, () => ({
       url: "/vendor/serve-sim/helper/config?device=UDID-1",
@@ -275,7 +277,9 @@ test("waitForScreen reports a timeout when capture never becomes ready", async (
     response.writeHead(404).end();
   });
   const baseUrl = await listen(server);
-  await expect(waitForScreen(descriptor(baseUrl), 40, 5)).rejects.toMatchObject({
+  await expect(
+    waitForScreen(descriptor(baseUrl), { timeoutMs: 40, intervalMs: 5 }),
+  ).rejects.toMatchObject({
     data: { code: "timeout", mayHaveExecuted: false },
   });
   expect(requests).toBeGreaterThan(0);

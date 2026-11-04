@@ -6,10 +6,7 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { Schema } from "effect";
 import type { Device } from "./rpc.js";
 
-// A loopback proxy in front of the hub's video stream. The hub token unlocks every hub route, so the viewer gets this
-// proxy's own token instead, which reaches only `GET /video` for one device. Client messages are never relayed upstream
-// except a validated video reset. Upstream routes are the vendored serve-emu (H.264 WebSocket, token subprotocol) and
-// serve-sim (MJPEG GET, Bearer token) endpoints.
+// Give the viewer a video-only loopback token, never the hub credential. Relay H.264 or MJPEG and fixed reset messages.
 
 const LOOPBACK_HOST = "127.0.0.1";
 const VIDEO_PATH = "/video";
@@ -137,22 +134,21 @@ async function pumpMjpeg(
   const controller = new AbortController();
   controllers.add(controller);
   response.on("close", () => controller.abort());
-  const fetched = await fetch(upstream.url, {
-    method: "GET",
-    headers: { authorization: upstream.authorization },
-    signal: controller.signal,
-  });
-  if (!fetched.ok || !fetched.body) {
-    controllers.delete(controller);
-    return reject(response, 502);
-  }
-  response.writeHead(200, {
-    "content-type":
-      fetched.headers.get("content-type") ?? "multipart/x-mixed-replace; boundary=frame",
-    "cache-control": "no-store",
-  });
-  const reader = fetched.body.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
+    const fetched = await fetch(upstream.url, {
+      method: "GET",
+      headers: { authorization: upstream.authorization },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!fetched.ok || !fetched.body) return reject(response, 502);
+    response.writeHead(200, {
+      "content-type":
+        fetched.headers.get("content-type") ?? "multipart/x-mixed-replace; boundary=frame",
+      "cache-control": "no-store",
+    });
+    reader = fetched.body.getReader();
     while (!controller.signal.aborted) {
       const chunk = await reader.read();
       if (chunk.done) break;
@@ -161,7 +157,8 @@ async function pumpMjpeg(
     }
   } finally {
     controllers.delete(controller);
-    await reader.cancel().catch(() => {});
+    controller.abort();
+    await reader?.cancel().catch(() => {});
     if (!response.destroyed) response.end();
   }
 }
@@ -174,7 +171,10 @@ function bridgeWebSocket(
   downstream: WebSocket,
   sockets: Set<WebSocket>,
 ) {
-  const hub = new WebSocket(upstream.url, [upstream.subprotocol]);
+  const hub = new WebSocket(upstream.url, [upstream.subprotocol], {
+    maxPayload: MAX_BUFFERED_BYTES,
+  });
+  const hubToken = upstream.subprotocol.slice("serve-emu.token.".length);
   let resetRequested = false;
   sockets.add(downstream);
   sockets.add(hub);
@@ -187,7 +187,9 @@ function bridgeWebSocket(
   hub.on("message", (data: RawData, isBinary: boolean) => {
     if (downstream.readyState !== WebSocket.OPEN) return;
     if (isBinary && downstream.bufferedAmount > MAX_BUFFERED_BYTES) return;
-    downstream.send(data, { binary: isBinary });
+    downstream.send(isBinary ? data : text(data).replaceAll(hubToken, "[redacted]"), {
+      binary: isBinary,
+    });
   });
   hub.on("close", closeBoth);
   hub.on("error", closeBoth);
@@ -197,10 +199,7 @@ function bridgeWebSocket(
   });
   downstream.on("message", (data: RawData, isBinary: boolean) => {
     if (isBinary) return;
-    const text = (
-      Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data)
-    ).toString("utf8");
-    const parsed = Schema.decodeUnknownOption(Schema.fromJsonString(VideoReset))(text);
+    const parsed = Schema.decodeUnknownOption(Schema.fromJsonString(VideoReset))(text(data));
     if (parsed._tag === "None") return;
     if (hub.readyState === WebSocket.CONNECTING) {
       resetRequested = true;
@@ -211,6 +210,12 @@ function bridgeWebSocket(
   });
   downstream.on("close", closeBoth);
   downstream.on("error", closeBoth);
+}
+
+function text(data: RawData): string {
+  return (
+    Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data)
+  ).toString("utf8");
 }
 
 // Close the listener and every connection and fetch the proxy owns, then resolve once the listener has shut down.

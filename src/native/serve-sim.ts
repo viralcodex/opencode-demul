@@ -142,20 +142,25 @@ async function sendHid(
 // The hub reports ready before native capture starts; poll the screen config until the simulator display is served.
 export async function waitForScreen(
   stream: Device.StreamDescriptor,
-  timeoutMs = 30_000,
-  intervalMs = 500,
+  options: { timeoutMs?: number; intervalMs?: number; signal?: AbortSignal } = {},
 ): Promise<void> {
+  const { timeoutMs = 30_000, intervalMs = 500, signal } = options;
   const deadline = Date.now() + timeoutMs;
   const url = helperUrl(stream, "config");
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${stream.token}` },
       redirect: "error",
-      signal: AbortSignal.timeout(Math.max(1, Math.min(5_000, deadline - Date.now()))),
+      signal: AbortSignal.any([
+        AbortSignal.timeout(Math.max(1, Math.min(5_000, deadline - Date.now()))),
+        ...(signal ? [signal] : []),
+      ]),
     }).catch(() => null);
     await response?.body?.cancel().catch(() => undefined);
+    signal?.throwIfAborted();
     if (response?.ok) return;
-    await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
+    await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())), undefined, { signal });
   }
   throw deviceError(
     "timeout",

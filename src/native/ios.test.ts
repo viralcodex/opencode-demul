@@ -106,6 +106,30 @@ test("an already booted simulator is not booted again or owned by this call", as
   expect(fake.commands.map((spec) => spec.args)).toEqual([LIST_ARGS]);
 });
 
+test.each(["Shutdown", "Booting"])(
+  "cancelling bootstatus stops waiting and shuts down only a simulator we booted: %s",
+  async (state) => {
+    const abort = new AbortController();
+    const reason = new Error("selection changed");
+    const fake = fakeRun([result({ stdout: deviceList(state) }), result(), result(), result()]);
+    const run = async (spec: CommandSpec) => {
+      const value = await fake.run(spec);
+      if (spec.args.includes("bootstatus")) {
+        expect(spec.signal).toBe(abort.signal);
+        abort.abort(reason);
+        throw reason;
+      }
+      return value;
+    };
+    await expect(ensureSimulatorBooted({ signal: abort.signal }, UDID, true, run)).rejects.toBe(
+      reason,
+    );
+    const shutdown = fake.commands.find((spec) => spec.args.includes("shutdown"));
+    expect(!!shutdown).toBe(state === "Shutdown");
+    expect(shutdown?.signal).toBeUndefined();
+  },
+);
+
 test("a shut down simulator requires explicit boot intent", async () => {
   const fake = fakeRun([result({ stdout: deviceList("Shutdown") })]);
   await expect(ensureSimulatorBooted({}, UDID, false, fake.run)).rejects.toMatchObject({

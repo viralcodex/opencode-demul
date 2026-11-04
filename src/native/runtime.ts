@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Device } from "../rpc.js";
@@ -36,8 +36,8 @@ import { startHub, type HubSession } from "./hub.js";
 import { readPngDimensions } from "./png.js";
 
 export interface DeviceRuntime {
-  list(platform?: Device.Platform): Promise<Device.DeviceInfo[]>;
-  open(input: OpenInput): Promise<OpenResult>;
+  list(platform?: Device.Platform, signal?: AbortSignal): Promise<Device.DeviceInfo[]>;
+  open(input: OpenInput, signal?: AbortSignal): Promise<OpenResult>;
   apps(handle: Device.DeviceHandle): Promise<Device.AppInfo[]>;
   launch(input: LaunchInput): Promise<Device.LaunchResult>;
   install(input: InstallInput): Promise<Device.InstallResult>;
@@ -155,11 +155,15 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
   };
 
   return {
-    async list(platform) {
-      if (platform) return backendFor(platform).list();
+    async list(platform, signal) {
+      signal?.throwIfAborted();
+      if (platform) return backendFor(platform).list(signal);
       const platforms = Object.keys(backends) as Device.Platform[];
       // One platform's missing toolchain must not hide the other platform's devices.
-      const results = await Promise.allSettled(platforms.map((entry) => backendFor(entry).list()));
+      const results = await Promise.allSettled(
+        platforms.map((entry) => backendFor(entry).list(signal)),
+      );
+      signal?.throwIfAborted();
       const listed = results.flatMap((result) =>
         result.status === "fulfilled" ? result.value : [],
       );
@@ -170,19 +174,23 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       return listed;
     },
 
-    async open(input) {
+    async open(input, signal) {
+      signal?.throwIfAborted();
       const backend = backendFor(input.platform);
       const externalNode = await node();
       const paths = await helpers(externalNode);
+      signal?.throwIfAborted();
       const { deviceId, bootedByUs } = await backend.ensureBooted(
         input.deviceId,
         input.boot ?? false,
+        signal,
       );
       // Everything acquired past this point is torn down in reverse if a later step throws, so a failed open never
       // leaks the device we booted, the hub we spawned, the handle we minted, or the state directory we created.
       const cleanups: Array<() => Promise<void>> = [];
       if (bootedByUs) cleanups.push(() => backend.shutdown(deviceId));
       try {
+        signal?.throwIfAborted();
         const env = backend.env;
         const hub = await startHub({
           externalNode,
@@ -190,13 +198,13 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           platform: input.platform,
           deviceId,
           env,
+          signal,
         });
         cleanups.push(() => hub.stop().catch(() => undefined));
-        await backend.streamReady(hub.descriptor);
         const handle = registry.create(input.platform, deviceId);
         cleanups.push(async () => registry.release(handle));
         const stateDir = join(stateRoot, handle.token);
-        await mkdir(stateDir, { recursive: true });
+        await mkdir(stateDir, { recursive: true, mode: 0o700 });
         cleanups.push(() => rm(stateDir, { recursive: true, force: true }).catch(() => undefined));
         const automation = createAutomation({
           externalNode,
@@ -209,11 +217,13 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
         cleanups.push(async () => {
           await automation.run(closeArgs(), 10_000).catch(() => undefined);
         });
-        automation.require(
-          await automation.run(["open", "--no-test-ime", "--no-record"]),
-          "Opening the automation session",
-        );
-        const capabilities = await readCapabilities(automation);
+        const [screen, controls] = await Promise.allSettled([
+          backend.streamReady(hub.descriptor, signal),
+          openAutomation(automation, signal),
+        ]);
+        if (screen.status === "rejected") throw screen.reason;
+        if (controls.status === "rejected") throw controls.reason;
+        const capabilities = controls.value;
         attachments.set(handle.token, {
           handle,
           backend,
@@ -294,7 +304,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
     },
 
     async tap(input) {
-      const found = attachment(input.handle, "press");
+      const found = attachment(input.handle, input.viewport ? "stream" : "press");
       if (input.viewport) {
         await found.backend.tap(found.hub.descriptor, {
           x: input.point.x / input.viewport.width,
@@ -323,7 +333,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
     },
 
     async swipe(input) {
-      const found = attachment(input.handle, "swipe");
+      const found = attachment(input.handle, input.viewport ? "stream" : "swipe");
       if (input.viewport) {
         const { width, height } = input.viewport;
         await found.backend.swipe(
@@ -355,28 +365,40 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
     async screenshot(handle) {
       const found = attachment(handle, "screenshot");
-      const path = join(found.stateDir, `screenshot-${Date.now()}.png`);
-      found.automation.require(
-        await found.automation.run(screenshotArgs(path)),
-        "Capturing a screenshot",
-      );
-      const data = await readFile(path).catch(() => null);
-      await rm(path, { force: true });
-      if (!data)
-        throw deviceError("invalid-artifact", "The screenshot helper wrote no readable file.");
-      if (data.byteLength > Device.MAX_SCREENSHOT_BYTES) {
-        throw deviceError("invalid-artifact", "The screenshot exceeded the maximum allowed size.");
+      const path = join(found.stateDir, `screenshot-${crypto.randomUUID()}.png`);
+      try {
+        found.automation.require(
+          await found.automation.run(screenshotArgs(path)),
+          "Capturing a screenshot",
+        );
+        const file = await lstat(path).catch(() => null);
+        if (!file?.isFile())
+          throw deviceError("invalid-artifact", "The screenshot helper wrote no readable file.");
+        if (file.size > Device.MAX_SCREENSHOT_BYTES)
+          throw deviceError(
+            "invalid-artifact",
+            "The screenshot exceeded the maximum allowed size.",
+          );
+        const data = await readFile(path).catch(() => null);
+        if (!data)
+          throw deviceError("invalid-artifact", "The screenshot helper wrote no readable file.");
+        if (data.byteLength > Device.MAX_SCREENSHOT_BYTES)
+          throw deviceError(
+            "invalid-artifact",
+            "The screenshot exceeded the maximum allowed size.",
+          );
+        const dimensions = readPngDimensions(data);
+        if (!dimensions)
+          throw deviceError("invalid-artifact", "The screenshot was not a readable PNG.");
+        return {
+          data,
+          ...dimensions,
+          deviceId: found.handle.deviceId,
+          platform: found.handle.platform,
+        };
+      } finally {
+        await rm(path, { force: true }).catch(() => undefined);
       }
-      const dimensions = readPngDimensions(data);
-      if (!dimensions)
-        throw deviceError("invalid-artifact", "The screenshot was not a readable PNG.");
-      return {
-        data: new Uint8Array(data),
-        width: dimensions.width,
-        height: dimensions.height,
-        deviceId: found.handle.deviceId,
-        platform: found.handle.platform,
-      };
     },
 
     async stream(handle) {
@@ -387,11 +409,7 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       const found = attachments.get(input.handle.token);
       if (!found) return;
       // Verify the whole handle, not just the token, so a stale or mismatched handle never tears down a live device.
-      if (
-        found.handle.generation !== input.handle.generation ||
-        found.handle.platform !== input.handle.platform ||
-        found.handle.deviceId !== input.handle.deviceId
-      ) {
+      if (!Device.sameHandle(found.handle, input.handle)) {
         throw deviceError(
           "detached",
           "This device handle is no longer attached; open the device again.",
@@ -414,15 +432,32 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
   };
 
   async function teardown(entry: Attachment): Promise<void> {
-    await entry.automation.run(closeArgs()).catch(() => undefined);
-    await entry.hub.stop().catch(() => undefined);
+    await Promise.all([
+      entry.automation.run(closeArgs(), 10_000).catch(() => undefined),
+      entry.hub.stop().catch(() => undefined),
+    ]);
     await rm(entry.stateDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
+async function openAutomation(
+  automation: Automation,
+  signal?: AbortSignal,
+): Promise<Device.Capabilities> {
+  automation.require(
+    await automation.run(["open", "--no-test-ime", "--no-record"], undefined, signal),
+    "Opening the automation session",
+  );
+  return readCapabilities(automation, signal);
+}
+
 // Read only capabilities reported by the automation engine. Streaming is a separate backend.
-async function readCapabilities(automation: Automation): Promise<Device.Capabilities> {
-  const result = await automation.run(capabilitiesArgs()).catch(() => null);
+async function readCapabilities(
+  automation: Automation,
+  signal?: AbortSignal,
+): Promise<Device.Capabilities> {
+  const result = await automation.run(capabilitiesArgs(), undefined, signal).catch(() => null);
+  signal?.throwIfAborted();
   const reported = result && result.code === 0 ? parseCapabilities(result.stdout) : null;
   const base = (reported ?? []).filter((capability) => capability !== "stream");
   const supported = [...new Set<Device.Capability>([...base, "stream"])];

@@ -12,7 +12,6 @@ simulators on macOS.
 - OpenCode Desktop compatible with plugin SDK 2.2.2, using a local server.
 - Node 22.19+ on the 22.x line, or Node 24+, with npm.
 - Android SDK Platform-Tools and Emulator, a configured Android Virtual Device, and hardware virtualization enabled.
-- ffmpeg with libx264 on the desktop process's PATH.
 - For iOS (macOS only): Xcode with an iOS Simulator runtime, selected with `xcode-select`.
 
 Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` if your SDK is outside the standard Android Studio location.
@@ -28,9 +27,9 @@ Add this entry to your OpenCode configuration.
 }
 ```
 
-Restart OpenCode Desktop, then open **Add tab > Device** in a session.
+Open **Add tab > Device** in a session.
 First use downloads the pinned device helpers from npm.
-Android SDK tools, Node and ffmpeg must already be installed.
+Android SDK tools and Node must already be installed. Android video uses the device's H.264 encoder through scrcpy.
 
 ## Use
 
@@ -39,10 +38,13 @@ and starts it if needed. Use the platform and device pickers to switch between A
 emulators and iOS simulators, and refresh to rescan. Either platform's toolchain may be
 missing; the picker lists what the host can run.
 
+Discovery and startup run in the background. The controls remain available while a device
+boots; selecting another device cancels the pending attachment.
+
 Each session controls its own device. Run iOS and Android side by side in separate sessions;
 a device already controlled by another session cannot be attached. Tabs and windows showing
 the same session share its device and agent-access setting. Closing a viewer stops its video
-without detaching the device, so agents can keep working. Detach the device in the panel to
+without detaching the device, so agents can keep working. Use `device.close` to
 release it; deleting or moving the session also releases it. A failed device switch keeps the
 previous attachment.
 
@@ -57,6 +59,8 @@ The first iOS automation command builds the agent's XCTest runner, which can tak
 [Physical devices, remote servers and direct keyboard input into the panel coming soon.]
 
 Prebuilt plugin files are included.
+
+[Release notes for v0.3.0](https://github.com/viralcodex/opencode-demul/releases/tag/v0.3.0).
 
 ## Development
 

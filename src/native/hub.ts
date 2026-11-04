@@ -45,6 +45,7 @@ export interface HubOptions {
   stopGraceMs?: number;
   stopKillMs?: number;
   env?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 // The hub's ready endpoint: a loopback origin and the session token minted by `--require-token`.
@@ -73,6 +74,7 @@ export function hubArgs(options: HubOptions): string[] {
     options.platform,
     "--single-device",
     options.deviceId,
+    ...(options.platform === "android" ? ["--stream-source", "scrcpy"] : []),
   ];
 }
 
@@ -109,6 +111,7 @@ export interface HubSession {
 }
 
 export function startHub(options: HubOptions, spawn = spawnProcess): Promise<HubSession> {
+  if (options.signal?.aborted) return Promise.reject(options.signal.reason);
   const readyTimeoutMs = options.readyTimeoutMs ?? 60_000;
   return new Promise<HubSession>((resolve, reject) => {
     let settled = false;
@@ -127,24 +130,23 @@ export function startHub(options: HubOptions, spawn = spawnProcess): Promise<Hub
       },
     });
     const timer = setTimeout(() => {
-      if (settled) return;
-      finish(() => {
-        void stop().then(
-          () =>
-            reject(
-              deviceError("timeout", "The device hub did not become ready within the deadline."),
-            ),
-          reject,
-        );
-      });
+      fail(deviceError("timeout", "The device hub did not become ready within the deadline."));
     }, readyTimeoutMs);
     const stop = () => stopProcess(process, options.stopGraceMs, options.stopKillMs);
     const finish = (action: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
       action();
     };
+    const fail = (error: unknown) =>
+      finish(() => {
+        void stop().then(() => reject(error), reject);
+      });
+    const abort = () => fail(options.signal?.reason);
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
     const finishReady = (value: HubReady) =>
       finish(() =>
         resolve({

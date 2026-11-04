@@ -6,10 +6,9 @@ import { Session } from "@opencode/schema/session";
 import { Tool } from "@opencode/schema/tool";
 import { Deferred, Effect, Option, Schema, Stream } from "effect";
 import { DeviceBridge } from "./bridge.js";
+import { Device } from "./rpc.js";
 
-// One desktop connection for a session. The map is keyed by the session ID string the control RPC carries, and keeps
-// the decoded `Session.ID` for the session operations. `state` is the last `Attachment` the desktop pushed, or null
-// until it opens a device. Each in-flight agent request parks a `Deferred` the desktop later resolves through `result`.
+// Session-bound desktop state. Each pending request is claimed once and completed through the result RPC.
 interface Attachment {
   readonly connectionID: string;
   readonly sessionID: Session.ID;
@@ -26,6 +25,14 @@ interface Attachment {
 }
 
 export type Server = Effect.Success<ReturnType<typeof make>>;
+
+type FailureData = Extract<DeviceBridge.Outcome, { type: "failure" }>["error"];
+
+const unavailable = <Failure>(
+  call: { error(code: "unavailable", message: string, data: FailureData): Failure },
+  code: FailureData["code"],
+  message: string,
+) => call.error("unavailable", message, { code, message, mayHaveExecuted: false });
 
 export const make = Effect.fn("DeviceServer.make")(function* (
   ctx: Pick<Context, "rpc" | "session" | "location" | "event">,
@@ -51,40 +58,20 @@ export const make = Effect.fn("DeviceServer.make")(function* (
         Effect.gen(function* () {
           const decoded = Schema.decodeUnknownOption(Session.ID)(input.sessionID);
           if (Option.isNone(decoded))
-            return yield* Effect.fail(
-              call.error("unavailable", "Invalid session id.", {
-                code: "not-found",
-                message: "Invalid session id.",
-                mayHaveExecuted: false,
-              }),
-            );
+            return yield* Effect.fail(unavailable(call, "not-found", "Invalid session id."));
           const sessionID = decoded.value;
-          const session = yield* ctx.session.get({ sessionID }).pipe(
-            Effect.mapError(() =>
-              call.error("unavailable", "Session not found.", {
-                code: "not-found",
-                message: "Session not found.",
-                mayHaveExecuted: false,
-              }),
-            ),
-          );
+          const session = yield* ctx.session
+            .get({ sessionID })
+            .pipe(Effect.mapError(() => unavailable(call, "not-found", "Session not found.")));
           if (session.location.directory !== ctx.location.directory)
             return yield* Effect.fail(
-              call.error("unavailable", "Session belongs to another location.", {
-                code: "not-found",
-                message: "Session belongs to another location.",
-                mayHaveExecuted: false,
-              }),
+              unavailable(call, "not-found", "Session belongs to another location."),
             );
           const attachment = yield* Effect.acquireRelease(
             Effect.gen(function* () {
               if (!active)
                 return yield* Effect.fail(
-                  call.error("unavailable", "Device server is shutting down.", {
-                    code: "internal",
-                    message: "Device server is shutting down.",
-                    mayHaveExecuted: false,
-                  }),
+                  unavailable(call, "internal", "Device server is shutting down."),
                 );
               yield* close(input.sessionID, "replaced");
               const attachment: Attachment = {
@@ -112,11 +99,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
           const attachment = attachments.get(input.sessionID);
           if (!attachment || attachment.connectionID !== input.connectionID)
             return yield* Effect.fail(
-              call.error("unavailable", "Device connection is unavailable.", {
-                code: "detached",
-                message: "Device connection is unavailable.",
-                mayHaveExecuted: false,
-              }),
+              unavailable(call, "detached", "Device connection is unavailable."),
             );
           attachment.state = input.state;
         }),
@@ -129,11 +112,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
               : undefined;
           if (!pending || pending.claimed)
             return yield* Effect.fail(
-              call.error("unavailable", "Device request is no longer available.", {
-                code: "detached",
-                message: "Device request is no longer available.",
-                mayHaveExecuted: false,
-              }),
+              unavailable(call, "detached", "Device request is no longer available."),
             );
           pending.claimed = true;
           return pending.operation;
@@ -143,11 +122,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
           const attachment = attachments.get(input.sessionID);
           if (!attachment || attachment.connectionID !== input.connectionID)
             return yield* Effect.fail(
-              call.error("unavailable", "Device connection is unavailable.", {
-                code: "detached",
-                message: "Device connection is unavailable.",
-                mayHaveExecuted: false,
-              }),
+              unavailable(call, "detached", "Device connection is unavailable."),
             );
           const pending = attachment.pending.get(input.requestID);
           if (!pending) return;
@@ -256,10 +231,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
         return { type: "attachment" as const, attachment: device };
       }
       // Device-bound operations must target the attached handle, so a stale handle is rejected before dispatch.
-      if (
-        device.handle.token !== operation.handle.token ||
-        device.handle.generation !== operation.handle.generation
-      )
+      if (!Device.sameHandle(device.handle, operation.handle))
         return yield* new Tool.Error({
           message:
             "[device.detached] This device handle no longer matches the attached device. Call the state tool to read the current handle, then retry with it.",

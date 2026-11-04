@@ -433,3 +433,136 @@ test("cancelling a queued action prevents dispatch while preserving the active a
   expect(item.calls).toEqual(["open", "key"]);
   await item.controller.dispose();
 });
+
+test("switches show the new device immediately, preserve ownership, and allow switching back during cleanup", async () => {
+  const item = fixture();
+  const first = await item.controller.open(caller, selection, "manual");
+  item.controller.access(caller, false);
+  const close = item.runtime.close;
+  item.runtime.close = async (input) => {
+    if (input.handle.token === first.handle.token) {
+      item.started.resolve();
+      await item.release.promise;
+    }
+    await close(input);
+  };
+  const second = await item.controller.open(
+    caller,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
+  await item.started.promise;
+  expect(item.controller.state(caller)?.handle).toEqual(second.handle);
+  expect(second.agentAccess).toBe(false);
+  expect(await item.controller.stream(caller, second.handle)).toMatchObject({ deviceId: "iphone" });
+  await expect(item.controller.stream(caller, first.handle)).rejects.toMatchObject({
+    code: "permission-denied",
+  });
+  await expect(
+    item.controller.open({ ...caller, sessionID: "other" }, selection, "manual"),
+  ).rejects.toMatchObject({ code: "device-busy" });
+  const returning = item.controller.open(caller, selection, "manual");
+  item.release.resolve();
+  const returned = await returning;
+  expect(returned.handle.platform).toBe("android");
+  expect(returned.handle.token).not.toBe(first.handle.token);
+  expect(returned.agentAccess).toBe(false);
+  await item.controller.dispose();
+  expect(item.calls).toEqual(["open", "open", "close", "open", "close", "dispose"]);
+});
+
+test("a failed switch preserves the current screen and attachment", async () => {
+  const item = fixture();
+  const first = await item.controller.open(caller, selection, "manual");
+  item.runtime.open = async () => {
+    throw deviceError("helper-failed", "capture failed");
+  };
+  await expect(
+    item.controller.open(caller, { platform: "ios", deviceId: "iphone" }, "manual"),
+  ).rejects.toMatchObject({ code: "helper-failed" });
+  expect(item.controller.state(caller)?.handle).toEqual(first.handle);
+  expect(await item.controller.stream(caller, first.handle)).toMatchObject({ deviceId: "phone" });
+  await item.controller.dispose();
+});
+
+test("failed retired cleanup is retried on disposal without reverting the active device", async () => {
+  const item = fixture();
+  const first = await item.controller.open(caller, selection, "manual");
+  const close = item.runtime.close;
+  let failures = 0;
+  item.runtime.close = async (input) => {
+    if (input.handle.token === first.handle.token && failures++ === 0)
+      throw deviceError("timeout", "cleanup failed");
+    await close(input);
+  };
+  const second = await item.controller.open(
+    caller,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
+  expect(item.controller.state(caller)?.handle).toEqual(second.handle);
+  await item.controller.dispose();
+  expect(item.calls).toEqual(["open", "open", "close", "dispose"]);
+});
+
+test("a switch does not wait for an old in-flight action and never replays queued input on the new device", async () => {
+  const item = fixture();
+  const first = await item.controller.open(caller, selection, "manual");
+  const active = item.controller.run(
+    caller,
+    { type: "key", handle: first.handle, key: "home" },
+    "agent",
+  );
+  await item.started.promise;
+  const queued = item.controller
+    .run(caller, { type: "key", handle: first.handle, key: "back" }, "agent")
+    .catch((error: unknown) => error);
+  const second = await item.controller.open(
+    caller,
+    { platform: "ios", deviceId: "iphone" },
+    "manual",
+  );
+  expect(await item.controller.stream(caller, second.handle)).toMatchObject({ deviceId: "iphone" });
+  expect(item.calls).toEqual(["open", "key", "open"]);
+  item.release.resolve();
+  await active;
+  expect(await queued).toMatchObject({ code: "permission-denied" });
+  await item.controller.dispose();
+  expect(item.calls).toEqual(["open", "key", "open", "close", "dispose"]);
+});
+
+test("a newer selection does not wait for a cancelled boot's cleanup and the cancelled device never becomes active", async () => {
+  const item = fixture();
+  await item.controller.open(caller, selection, "manual");
+  const open = item.runtime.open;
+  let cancelled: AbortSignal | undefined;
+  item.runtime.open = async (input, signal) => {
+    if (input.platform === "ios") {
+      cancelled = signal;
+      item.started.resolve();
+      await item.release.promise;
+    }
+    return open(input);
+  };
+  const previous = item.controller
+    .open(caller, { platform: "ios", deviceId: "iphone" }, "manual")
+    .catch((error: unknown) => error);
+  await item.started.promise;
+  item.controller.access(caller, false);
+  expect(await item.controller.list()).toEqual([]);
+  const latest = await item.controller.open(
+    caller,
+    { ...selection, deviceId: "other-phone" },
+    "manual",
+  );
+  expect(cancelled?.aborted).toBe(true);
+  expect(latest.agentAccess).toBe(false);
+  expect(await item.controller.stream(caller, latest.handle)).toMatchObject({
+    deviceId: "other-phone",
+  });
+  item.release.resolve();
+  expect(await previous).toMatchObject({ name: "AbortError" });
+  expect(item.controller.state(caller)?.handle).toEqual(latest.handle);
+  expect(item.closes.find((input) => input.handle.deviceId === "iphone")?.shutdown).toBe(true);
+  await item.controller.dispose();
+});

@@ -62,6 +62,7 @@ import {
 import { readPngDimensions } from "./png.js";
 import {
   appendBounded,
+  runCommand,
   spawnProcess,
   stopProcess,
   type CommandResult,
@@ -183,12 +184,66 @@ test("process output retains complete lines and bounds oversized partial lines",
   const lines: string[] = [];
   const child = spawnProcess({
     command: process.execPath,
-    args: ["--eval", 'process.stdout.write("first\\n" + "x".repeat(100) + "\\nlast\\n");'],
+    args: [
+      "--eval",
+      'process.stdout.write("first\\n" + "x".repeat(100) + "\\nlast\\n"); process.stderr.write("x".repeat(262144));',
+    ],
     maxBytes: 8,
     onStdoutLine: (line) => lines.push(line),
   });
   await child.exited;
   expect(lines).toEqual(["first", "xxxxxxxx", "last"]);
+  const captured = await runCommand({
+    command: process.execPath,
+    args: [
+      "--eval",
+      'const data = Buffer.from("abcdef你好"); process.stdout.write(data.subarray(0, 7)); setImmediate(() => process.stdout.write(data.subarray(7)));',
+    ],
+    maxBytes: 6,
+    timeoutMs: 1_000,
+  });
+  expect(captured.stdout).toBe("你好");
+});
+
+test("native commands leave the event loop responsive and cancellation kills the pending child", async () => {
+  const abort = new AbortController();
+  const reason = new Error("selection changed");
+  const pending = runCommand({
+    command: process.execPath,
+    args: ["--eval", "setInterval(() => {}, 1000)"],
+    timeoutMs: 5_000,
+    signal: abort.signal,
+  });
+  const outcome = pending.catch((error: unknown) => error);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  abort.abort(reason);
+  expect(await outcome).toBe(reason);
+  await expect(
+    runCommand({ command: "/must-not-spawn", args: [], timeoutMs: 5_000, signal: abort.signal }),
+  ).rejects.toBe(reason);
+});
+
+test("cancelling Android startup terminates only the emulator it spawned", async () => {
+  const abort = new AbortController();
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  const pending = ensureBooted({ timeoutMs: 5_000 }, "fixture-avd", true, {
+    signal: abort.signal,
+    run: async () => ({ code: 0, signal: null, stdout: "", stderr: "", timedOut: false }),
+    spawn: () => {
+      queueMicrotask(() => abort.abort());
+      return {
+        pid: undefined,
+        exited: exited.promise,
+        stop(signal = "SIGTERM") {
+          signals.push(signal);
+          exited.resolve({ code: null, signal });
+        },
+      };
+    },
+  });
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(signals).toEqual(["SIGTERM"]);
 });
 
 test("Android cold boot uses only the serial reported by its own child", async () => {
@@ -788,6 +843,8 @@ test("hub arg builder pins host, token, the platform's served transport, platfor
     "android",
     "--single-device",
     "emulator-5554",
+    "--stream-source",
+    "scrcpy",
   ]);
   const ios = hubArgs({
     externalNode: "node",
@@ -1089,6 +1146,15 @@ test("HandleRegistry mints handles, bumps revisions, and enforces reference vali
   const handle = registry.create("android", "emulator-5554");
   expect(handle.generation).toBe(1);
   expect(registry.revision(handle)).toBe(0);
+  for (const forged of [
+    { ...handle, platform: "ios" as const },
+    { ...handle, deviceId: "other-device" },
+    { ...handle, generation: 2 },
+  ]) {
+    expect(() => registry.require(forged)).toThrow();
+    expect(() => registry.release(forged)).toThrow();
+  }
+  expect(registry.require(handle)).toEqual(handle);
   const revision = registry.nextSnapshot(handle);
   expect(revision).toBe(1);
   const good: Device.SnapshotReference = {

@@ -88,6 +88,8 @@ const SnapshotReport = Schema.Struct({
 
 // Decode agent-device's bare `e<n>` ref into the contract's branded, `@`-prefixed {@link Device.ElementRef}.
 const decodeRef = Schema.decodeUnknownOption(Device.ElementRef);
+const parseRef = (ref: string | undefined) =>
+  ref ? decodeRef(ref.startsWith("@") ? ref : `@${ref}`) : Option.none();
 
 export function parseSnapshotJson(
   output: string,
@@ -97,9 +99,7 @@ export function parseSnapshotJson(
   const nodes = parsed.value.data.nodes.flatMap((node) => {
     const role = node.kind ?? node.type;
     if (!role) return [];
-    const decoded = node.ref
-      ? decodeRef(node.ref.startsWith("@") ? node.ref : `@${node.ref}`)
-      : Option.none();
+    const decoded = parseRef(node.ref);
     const result: Device.AccessibilityNode = {
       role,
       ...(Option.isSome(decoded) ? { ref: decoded.value } : {}),
@@ -218,7 +218,7 @@ export function parseFailure(
 }
 
 export interface Automation {
-  run(args: readonly string[], timeoutMs?: number): Promise<CommandResult>;
+  run(args: readonly string[], timeoutMs?: number, signal?: AbortSignal): Promise<CommandResult>;
   // Map a non-zero result to a typed device error. `mayHaveExecuted` marks a mutation that was already dispatched.
   require(result: CommandResult, action: string, mayHaveExecuted?: boolean): CommandResult;
 }
@@ -233,7 +233,7 @@ export function createAutomation(options: AutomationOptions): Automation {
     options.platform === "android" ? "--serial" : "--udid",
     options.deviceId,
   ];
-  const run: Automation["run"] = (args, timeoutMs) =>
+  const run: Automation["run"] = (args, timeoutMs, signal) =>
     runCommand({
       command: options.externalNode,
       // `--json` makes failures structured, so their code and dispatch certainty survive.
@@ -246,6 +246,7 @@ export function createAutomation(options: AutomationOptions): Automation {
       cwd: options.stateDir,
       env: options.env,
       timeoutMs: timeoutMs ?? timeout,
+      signal,
     });
   const require: Automation["require"] = (result, action, mayHaveExecuted = false) => {
     if (result.timedOut) throw deviceError("timeout", `${action} timed out.`, mayHaveExecuted);

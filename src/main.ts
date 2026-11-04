@@ -279,13 +279,16 @@ export function createMainSetup(
         const connection = connections.get(connectionKey(input));
         return connection ? unsubscribe(connection, ipcCaller.window) : Promise.resolve();
       },
-      list: async (input) =>
+      list: async (input, ipcCaller) =>
         deviceOutcome(async () => {
           requireLocal(input.serverID);
           const owner = input.sessionID
             ? { serverID: input.serverID, sessionID: input.sessionID }
             : undefined;
-          return { type: "devices", devices: await getController().list(input.platform, owner) };
+          return {
+            type: "devices",
+            devices: await getController().list(input.platform, owner, ipcCaller.signal),
+          };
         }),
       access: async (input, ipcCaller) => {
         const connection = current(input.scope, ipcCaller.window);
@@ -364,7 +367,10 @@ export async function runOperation(
     signal?.throwIfAborted();
     switch (operation.type) {
       case "list":
-        return { type: "devices", devices: await controller.list(operation.platform, caller) };
+        return {
+          type: "devices",
+          devices: await controller.list(operation.platform, caller, signal),
+        };
       case "state":
         return { type: "state", state: controller.state(caller) };
       case "open":
@@ -403,6 +409,12 @@ async function deviceStreamOutcome(
 
 function failure(error: unknown) {
   if (isDeviceFailure(error)) return error.data;
+  if (error instanceof Error && error.name === "AbortError")
+    return {
+      code: "detached" as const,
+      message: "The pending device request was cancelled.",
+      mayHaveExecuted: false,
+    };
   return {
     code: "internal" as const,
     message: String(error).slice(0, 2_048),

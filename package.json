@@ -38,7 +38,7 @@
     "fmt": "oxfmt --write --ignore-path .oxfmtignore .",
     "fmt:check": "oxfmt --check --ignore-path .oxfmtignore .",
     "bundle": "node node_modules/vite/bin/vite.js build --configLoader runner && bun build src/index.ts --target=node --format=esm --packages=external --outfile=dist/server.js",
-    "typecheck": "tsc6 --noEmit -p tsconfig.test.json",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test": "bun test",
     "check": "bun run lint && bun run fmt:check && bun run typecheck && bun test",
     "verify:package": "node script/verify-package.mjs",
@@ -61,7 +61,7 @@
     "oxfmt": "0.75.0",
     "oxlint": "1.90.0",
     "solid-js": "1.9.17",
-    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "typescript": "6.0.2",
     "vite": "7.3.7",
     "vite-plugin-solid": "2.11.10"
   },

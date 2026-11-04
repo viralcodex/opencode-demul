@@ -151,3 +151,10 @@
   overflow-wrap: anywhere;
   pointer-events: none;
 }
+
+.device-panel__viewer-state--pending {
+  inset: 12px auto auto;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: var(--background-base);
+}

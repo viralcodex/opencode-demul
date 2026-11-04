@@ -210,6 +210,15 @@ export const DeviceErrorCode = Schema.Literals([
 ]).annotate({ identifier: "Device.DeviceErrorCode" });
 export type DeviceErrorCode = typeof DeviceErrorCode.Type;
 
+export function sameHandle(expected: DeviceHandle, actual: DeviceHandle): boolean {
+  return (
+    expected.token === actual.token &&
+    expected.generation === actual.generation &&
+    expected.platform === actual.platform &&
+    expected.deviceId === actual.deviceId
+  );
+}
+
 // A structured device error. `mayHaveExecuted` is true when a mutating native action was already dispatched before the
 // failure, so a caller never reports a possibly-applied action as cleanly cancelled.
 export interface DeviceError extends Schema.Schema.Type<typeof DeviceError> {}

@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { deviceError } from "./errors.js";
 
-// The child-process boundary for the native runtime. The plugin's Electron main process never imports a native addon;
-// it spawns the helper CLIs under an external Node runtime and talks to them here. Output is bounded so a chatty or
-// runaway helper cannot grow memory without limit, and every run has a deadline.
+// Run helpers outside Electron. Capture bounded diagnostics and enforce command and cleanup deadlines.
 
 export interface CommandSpec {
   command: string;
@@ -12,6 +11,7 @@ export interface CommandSpec {
   env?: Record<string, string>;
   // Deadline in milliseconds. On expiry the child is killed and `timedOut` is true.
   timeoutMs: number;
+  signal?: AbortSignal;
   // The maximum bytes retained per stream. Beyond this the capture is truncated, not dropped.
   maxBytes?: number;
   // Optional data to write to the child's stdin, then close it.
@@ -36,46 +36,63 @@ export function appendBounded(current: string, chunk: string, maxBytes: number):
   return combined.length <= maxBytes ? combined : combined.slice(combined.length - maxBytes);
 }
 
-// Run a command to completion and capture its bounded output. Never rejects: a missing executable, a non-zero exit, and
-// a timeout all resolve to a {@link CommandResult} the caller inspects, so the runtime maps them to typed device errors
-// rather than unwinding through exceptions.
+// Command failures return bounded diagnostics. Cancellation kills the child and rejects with the caller's reason.
 export function runCommand(spec: CommandSpec): Promise<CommandResult> {
-  const maxBytes = spec.maxBytes ?? DEFAULT_MAX_BYTES;
-  return new Promise((resolve) => {
+  if (spec.signal?.aborted) return Promise.reject(spec.signal.reason);
+  const maxBytes = Math.max(0, spec.maxBytes ?? DEFAULT_MAX_BYTES);
+  return new Promise((resolve, reject) => {
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
       env: spec.env ? { ...process.env, ...spec.env } : process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdout = capture(maxBytes);
+    const stderr = capture(maxBytes);
     let timedOut = false;
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, spec.timeoutMs);
-    const finish = (result: CommandResult) => {
+    const abort = () => child.kill("SIGKILL");
+    spec.signal?.addEventListener("abort", abort, { once: true });
+    const finish = (result: Omit<CommandResult, "stdout" | "stderr">) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      spec.signal?.removeEventListener("abort", abort);
+      if (spec.signal?.aborted) reject(spec.signal.reason);
+      else resolve({ ...result, stdout: stdout.text(), stderr: stderr.text() });
     };
-    child.stdout?.on(
-      "data",
-      (chunk: Buffer) => (stdout = appendBounded(stdout, chunk.toString("utf8"), maxBytes)),
-    );
-    child.stderr?.on(
-      "data",
-      (chunk: Buffer) => (stderr = appendBounded(stderr, chunk.toString("utf8"), maxBytes)),
-    );
+    child.stdout?.on("data", (chunk: Buffer) => stdout.append(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.append(chunk));
     child.on("error", (error) =>
-      finish({ code: null, signal: null, stdout, stderr, timedOut, spawnError: error.message }),
+      finish({ code: null, signal: null, timedOut, spawnError: error.message }),
     );
-    child.on("close", (code, signal) => finish({ code, signal, stdout, stderr, timedOut }));
+    child.on("close", (code, signal) => finish({ code, signal, timedOut }));
     if (spec.input !== undefined) child.stdin?.end(spec.input);
     else child.stdin?.end();
   });
+}
+
+// Keep bounded byte chunks and decode once, avoiding repeated large string copies and split UTF-8 characters.
+function capture(limit: number) {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  return {
+    append(chunk: Buffer) {
+      chunks.push(chunk);
+      size += chunk.byteLength;
+      while (size > limit) {
+        const first = chunks[0];
+        const remove = Math.min(first.byteLength, size - limit);
+        if (remove === first.byteLength) chunks.shift();
+        else chunks[0] = first.subarray(remove);
+        size -= remove;
+      }
+    },
+    text: () => Buffer.concat(chunks, size).toString("utf8"),
+  };
 }
 
 export interface LongRunningProcess {
@@ -135,7 +152,7 @@ async function waitForExit(process: LongRunningProcess, timeoutMs: number): Prom
   }
 }
 
-export interface SpawnSpec extends Omit<CommandSpec, "timeoutMs" | "input"> {
+export interface SpawnSpec extends Omit<CommandSpec, "timeoutMs" | "input" | "signal"> {
   // Called for each newline-delimited line the process writes to stdout.
   onStdoutLine?: (line: string) => void;
   // Called for each newline-delimited line the process writes to stderr.
@@ -179,10 +196,15 @@ function lineReader(
   onLine?: (line: string) => void,
   maxBytes = DEFAULT_MAX_BYTES,
 ) {
-  if (!stream || !onLine) return;
+  if (!stream) return;
+  if (!onLine) {
+    stream.resume();
+    return;
+  }
   let buffer = "";
+  const decoder = new StringDecoder("utf8");
   stream.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString("utf8");
+    buffer += decoder.write(chunk);
     let index = buffer.indexOf("\n");
     while (index !== -1) {
       onLine(appendBounded("", buffer.slice(0, index).replace(/\r$/u, ""), maxBytes));
@@ -192,6 +214,7 @@ function lineReader(
     buffer = appendBounded("", buffer, maxBytes);
   });
   stream.on("close", () => {
+    buffer = appendBounded(buffer, decoder.end(), maxBytes);
     if (buffer.length > 0) onLine(buffer.replace(/\r$/u, ""));
   });
 }

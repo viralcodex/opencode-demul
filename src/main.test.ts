@@ -129,6 +129,15 @@ test("routes every operation through the controller and returns typed failures",
     ),
   ).toMatchObject({ type: "success", value: { type: "apps", apps: [] } });
   expect(item.calls).toEqual(["open", "apps"]);
+  await expect(
+    runOperation(
+      controller,
+      caller,
+      { type: "open", platform: "ios", deviceId: "iphone" },
+      "manual",
+      AbortSignal.abort(),
+    ),
+  ).resolves.toMatchObject({ type: "failure", error: { code: "detached" } });
   await controller.dispose();
 });
 

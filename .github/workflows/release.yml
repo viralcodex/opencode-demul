@@ -47,6 +47,7 @@ jobs:
           assert.match(version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/);
           const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
           assert.equal(version, manifest.version, 'Commit the package version before releasing.');
+          assert.ok(readFileSync(`.github/releases/v${version}.md`, 'utf8').trim(), 'Commit nonempty release notes before releasing.');
           appendFileSync(process.env.GITHUB_OUTPUT, `tag=v${version}\n`);
           NODE
       - uses: actions/github-script@v7
@@ -80,6 +81,10 @@ jobs:
       actions: read
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: release-package
@@ -92,7 +97,7 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          args=(--target "$RELEASE_COMMIT" --title "$RELEASE_TAG" --generate-notes)
+          args=(--target "$RELEASE_COMMIT" --title "$RELEASE_TAG" --notes-file ".github/releases/$RELEASE_TAG.md")
           if [ "$PRERELEASE" = true ]; then
             args+=(--prerelease)
           fi

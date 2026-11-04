@@ -46,28 +46,37 @@ export interface ViewerOptions {
 export interface FramePacket {
   readonly bytes: Uint8Array;
   readonly key: boolean;
+  readonly codec?: string;
   readonly timestamp: number;
   readonly serverTimestamp?: number;
-  readonly width?: number;
-  readonly height?: number;
 }
 
 export interface MjpegFrames {
-  readonly frames: ReadonlyArray<Uint8Array>;
-  readonly rest: Uint8Array;
+  readonly frames: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+  readonly rest: Uint8Array<ArrayBuffer>;
 }
 
 const MAGIC = 0x53454d55;
+const FRAME_HEADERS: Readonly<Record<number, number | undefined>> = { 1: 16, 2: 24 };
 const MAX_JPEG_BUFFER = 16 * 1024 * 1024;
 
 export function createViewer(options: ViewerOptions) {
   let active = false;
   let stop: (() => void) | undefined;
 
+  const start = () => {
+    try {
+      return options.stream.protocol === "h264" ? playH264(options) : playMjpeg(options);
+    } catch (error) {
+      options.onState("paused");
+      options.onError(error instanceof Error ? error.message : String(error));
+      return () => {};
+    }
+  };
   const update = () => {
     const shouldPlay = active && document.visibilityState === "visible";
     if (shouldPlay && !stop) {
-      stop = options.stream.protocol === "h264" ? playH264(options) : playMjpeg(options);
+      stop = start();
       return;
     }
     if (shouldPlay || !stop) return;
@@ -97,37 +106,46 @@ export function createViewer(options: ViewerOptions) {
 
 export function parseFramePacket(input: ArrayBuffer): FramePacket | undefined {
   const data = new Uint8Array(input);
-  const view = new DataView(input);
   if (data.byteLength < 4) return;
-  if (view.getUint32(0) !== MAGIC) {
-    if (!hasAnnexBStart(data)) return;
-    return {
-      bytes: data,
-      key: hasNal(data, 5) || hasNal(data, 7),
-      timestamp: performance.now() * 1_000,
-    };
-  }
+  const view = new DataView(input);
+  if (view.getUint32(0) === MAGIC) return metadataFrame(data, view);
+  return videoFrame(data, performance.now() * 1_000, false);
+}
 
+function metadataFrame(data: Uint8Array, view: DataView): FramePacket | undefined {
   if (data.byteLength < 16) return;
-  const version = view.getUint8(4);
-  const header = version === 1 ? 16 : version === 2 ? 24 : 0;
+  const header = FRAME_HEADERS[view.getUint8(4)];
   if (!header || data.byteLength <= header) return;
   const pts = view.getBigUint64(8);
   if (pts > BigInt(Number.MAX_SAFE_INTEGER)) return;
-  const bytes = data.subarray(header);
-  if (!hasAnnexBStart(bytes)) return;
+  return videoFrame(
+    data.subarray(header),
+    Number(pts),
+    (view.getUint8(5) & 1) === 1,
+    header === 24 ? Number(view.getBigUint64(16)) / 1_000 : undefined,
+  );
+}
+
+function videoFrame(
+  bytes: Uint8Array,
+  timestamp: number,
+  key: boolean,
+  serverTimestamp?: number,
+): FramePacket | undefined {
+  const start = nalStart(bytes, 0);
+  if (start === undefined || start >= bytes.byteLength) return;
+  const info = annexBInfo(bytes);
   return {
     bytes,
-    key: (view.getUint8(5) & 1) === 1 || hasNal(bytes, 5) || hasNal(bytes, 7),
-    timestamp: Number(pts),
-    serverTimestamp: version === 2 ? Number(view.getBigUint64(16)) / 1_000 : undefined,
+    key: key || info.key,
+    codec: info.codec,
+    timestamp,
+    serverTimestamp,
   };
 }
 
 export function annexBCodec(data: Uint8Array) {
-  const sps = annexBNals(data).find((nal) => (nal[0] & 0x1f) === 7);
-  if (!sps || sps.byteLength < 4) return;
-  return `avc1.${[sps[1], sps[2], sps[3]].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return annexBInfo(data).codec;
 }
 
 export function contentPoint(
@@ -148,14 +166,7 @@ export function contentPoint(
     ].every(Number.isFinite)
   )
     return;
-  if (
-    bounds.width <= 0 ||
-    bounds.height <= 0 ||
-    !Number.isSafeInteger(size.width) ||
-    !Number.isSafeInteger(size.height)
-  )
-    return;
-  if (size.width <= 0 || size.height <= 0) return;
+  if (bounds.width <= 0 || bounds.height <= 0 || !validVideoSize(size)) return;
   const scale = Math.min(bounds.width / size.width, bounds.height / size.height);
   const width = size.width * scale;
   const height = size.height * scale;
@@ -180,14 +191,14 @@ export function multipartBoundary(contentType: string | null) {
   if (!value) return;
   const boundary = value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
   const normalized = boundary.startsWith("--") ? boundary.slice(2) : boundary;
-  if (!normalized || /[\r\n]/.test(normalized)) return;
+  if (!normalized) return;
   return normalized;
 }
 
-export function parseMjpegFrames(data: Uint8Array, boundary: string): MjpegFrames {
+export function parseMjpegFrames(data: Uint8Array<ArrayBuffer>, boundary: string): MjpegFrames {
   const delimiter = new TextEncoder().encode(`--${boundary}`);
   const separator = new Uint8Array([13, 10, 13, 10]);
-  const frames: Uint8Array[] = [];
+  const frames: Uint8Array<ArrayBuffer>[] = [];
   let cursor = 0;
   let consumed = 0;
   while (cursor < data.byteLength) {
@@ -195,44 +206,57 @@ export function parseMjpegFrames(data: Uint8Array, boundary: string): MjpegFrame
     if (start < 0) break;
     const line = start + delimiter.byteLength;
     if (line + 2 > data.byteLength) return { frames, rest: data.slice(start) };
-    if (data[line] !== 13 || data[line + 1] !== 10) {
+    if (!hasCrlf(data, line)) {
       cursor = line;
       continue;
     }
     const headerEnd = findBytes(data, separator, line + 2);
     if (headerEnd < 0) return { frames, rest: data.slice(start) };
     const headers = new TextDecoder("ascii").decode(data.subarray(line + 2, headerEnd));
-    const length = headers.match(/(?:^|\r\n)Content-Length:\s*(\d+)(?:\r\n|$)/i)?.[1];
-    const contentType = headers
-      .match(/(?:^|\r\n)Content-Type:\s*([^\r\n]+)(?:\r\n|$)/i)?.[1]
-      .trim()
-      .toLowerCase();
-    const bytes = length ? Number(length) : 0;
+    const bytes = jpegLength(headers);
     const frameStart = headerEnd + separator.byteLength;
-    const frameEnd = frameStart + bytes;
-    if (
-      !Number.isSafeInteger(bytes) ||
-      bytes <= 0 ||
-      bytes > MAX_JPEG_BUFFER ||
-      contentType !== "image/jpeg"
-    ) {
+    if (!bytes) {
       cursor = headerEnd + separator.byteLength;
       continue;
     }
+    const frameEnd = frameStart + bytes;
     if (frameEnd > data.byteLength) return { frames, rest: data.slice(start) };
-    const frame = data.slice(frameStart, frameEnd);
-    if (
-      frame.byteLength >= 4 &&
-      frame[0] === 0xff &&
-      frame[1] === 0xd8 &&
-      frame.at(-2) === 0xff &&
-      frame.at(-1) === 0xd9
-    )
-      frames.push(frame);
+    const frame = data.subarray(frameStart, frameEnd);
+    if (isJpeg(frame)) frames.push(frame);
     consumed = frameEnd;
     cursor = frameEnd;
   }
   return { frames, rest: data.slice(consumed) };
+}
+
+function hasCrlf(bytes: Uint8Array, offset: number): boolean {
+  return bytes[offset] === 13 && bytes[offset + 1] === 10;
+}
+
+function jpegLength(headers: string): number | undefined {
+  const length = headers.match(/(?:^|\r\n)Content-Length:\s*(\d+)(?:\r\n|$)/i)?.[1];
+  const contentType = headers
+    .match(/(?:^|\r\n)Content-Type:\s*([^\r\n]+)(?:\r\n|$)/i)?.[1]
+    .trim()
+    .toLowerCase();
+  const bytes = length ? Number(length) : 0;
+  if (
+    Number.isSafeInteger(bytes) &&
+    bytes > 0 &&
+    bytes <= MAX_JPEG_BUFFER &&
+    contentType === "image/jpeg"
+  )
+    return bytes;
+}
+
+function isJpeg(frame: Uint8Array): boolean {
+  return (
+    frame.byteLength >= 4 &&
+    frame[0] === 0xff &&
+    frame[1] === 0xd8 &&
+    frame.at(-2) === 0xff &&
+    frame.at(-1) === 0xd9
+  );
 }
 
 function playH264(options: ViewerOptions) {
@@ -250,6 +274,15 @@ function playH264(options: ViewerOptions) {
   let waitingKeyframe = true;
   let stopped = false;
   let playing = false;
+  let startupTimer: ReturnType<typeof setTimeout> | undefined;
+  const waitForFrame = () => {
+    clearTimeout(startupTimer);
+    startupTimer = setTimeout(
+      () =>
+        fail("Android video did not produce a screen within 15 seconds. Refresh devices to retry."),
+      15_000,
+    );
+  };
   socket.binaryType = "arraybuffer";
   options.onState("connecting");
 
@@ -267,19 +300,20 @@ function playH264(options: ViewerOptions) {
     codec = undefined;
     waitingKeyframe = true;
     playing = false;
-    if (previous && previous.state !== "closed") {
-      try {
-        previous.reset();
-      } finally {
-        previous.close();
-      }
+    if (previous && previous.state !== "closed") previous.close();
+    if (request && wasPlaying && !stopped) {
+      waitForFrame();
+      options.onState("connecting");
     }
-    if (request && wasPlaying && !stopped) options.onState("connecting");
     if (request) requestKeyframe();
   };
   const fail = (message: string) => {
     if (stopped) return;
-    options.onError(message);
+    stopped = true;
+    clearTimeout(startupTimer);
+    socket.close();
+    reset();
+    options.onError(message.replaceAll(options.stream.token, "[redacted]").slice(0, 512));
     options.onState("paused");
   };
   const decode = (frame: FramePacket, target: VideoDecoder) => {
@@ -294,35 +328,10 @@ function playH264(options: ViewerOptions) {
       );
       waitingKeyframe = false;
     } catch (error) {
-      reset(true);
       fail(`H.264 decode failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  socket.addEventListener("open", () => requestKeyframe());
-  socket.addEventListener("message", (event) => {
-    if (stopped) return;
-    if (typeof event.data === "string") {
-      if (videoSessionSize(event.data)) reset(true);
-      return;
-    }
-    if (!(event.data instanceof ArrayBuffer)) return;
-    const frame = parseFramePacket(event.data);
-    if (!frame) return;
-    if (decoder && decoder.decodeQueueSize > 2) {
-      reset(true);
-      return;
-    }
-    if (waitingKeyframe && !frame.key) return;
-
-    const nextCodec = annexBCodec(frame.bytes) ?? codec;
-    if (decoder && nextCodec === codec) {
-      decode(frame, decoder);
-      return;
-    }
-    if (!nextCodec) {
-      requestKeyframe();
-      return;
-    }
+  const configure = (frame: FramePacket, nextCodec: string) => {
     reset();
     codec = nextCodec;
     const generation = configuring;
@@ -331,8 +340,8 @@ function playH264(options: ViewerOptions) {
       optimizeForLatency: true,
       hardwareAcceleration: "prefer-hardware",
     };
-    void VideoDecoder.isConfigSupported(config).then(
-      (support) => {
+    void VideoDecoder.isConfigSupported(config)
+      .then((support) => {
         if (stopped || generation !== configuring) return;
         if (!support.supported) {
           fail(`H.264 codec ${nextCodec} is not supported by this browser`);
@@ -345,12 +354,13 @@ function playH264(options: ViewerOptions) {
               return;
             }
             try {
-              if (draw(options, output, output.displayWidth, output.displayHeight) && !playing) {
+              draw(options, output, output.displayWidth, output.displayHeight);
+              if (!playing) {
                 playing = true;
+                clearTimeout(startupTimer);
                 options.onState("playing");
               }
             } catch (error) {
-              reset(true);
               fail(
                 `Device video draw failed: ${error instanceof Error ? error.message : String(error)}`,
               );
@@ -360,7 +370,6 @@ function playH264(options: ViewerOptions) {
           },
           error(error) {
             if (stopped || decoder !== target) return;
-            reset(true);
             fail(`H.264 decoder failed: ${error.message}`);
           },
         });
@@ -373,27 +382,46 @@ function playH264(options: ViewerOptions) {
           );
           return;
         }
-        if (stopped || generation !== configuring) {
-          target.close();
-          return;
-        }
         decoder = target;
         decode(frame, target);
-      },
-      (error) =>
+      })
+      .catch((error) => {
+        if (stopped || generation !== configuring) return;
         fail(
-          `H.264 decoder support check failed: ${error instanceof Error ? error.message : String(error)}`,
-        ),
-    );
+          `H.264 decoder setup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  };
+  const receive = (frame: FramePacket) => {
+    if (decoder && decoder.decodeQueueSize > 2) return reset(true);
+    if (waitingKeyframe && !frame.key) return;
+    const nextCodec = frame.codec ?? codec;
+    if (!nextCodec) return requestKeyframe();
+    if (decoder && nextCodec === codec) return decode(frame, decoder);
+    configure(frame, nextCodec);
+  };
+  waitForFrame();
+  socket.addEventListener("open", requestKeyframe);
+  socket.addEventListener("message", (event) => {
+    if (stopped) return;
+    if (typeof event.data === "string") {
+      const message = videoMessage(event.data);
+      if (message?.type === "error") fail(`Android video failed: ${message.message}`);
+      if (message?.type === "reset") reset(true);
+      return;
+    }
+    if (!(event.data instanceof ArrayBuffer)) return;
+    const frame = parseFramePacket(event.data);
+    if (frame) receive(frame);
   });
   socket.addEventListener("error", () => fail("Device video connection failed"));
-  socket.addEventListener("close", () => {
-    reset();
-    if (!stopped) options.onState("paused");
+  socket.addEventListener("close", (event) => {
+    fail(`Device video connection closed (code ${event.code}). Refresh devices to retry.`);
   });
 
   return () => {
     stopped = true;
+    clearTimeout(startupTimer);
     socket.close();
     reset();
   };
@@ -402,9 +430,21 @@ function playH264(options: ViewerOptions) {
 function playMjpeg(options: ViewerOptions) {
   const abort = new AbortController();
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let bitmap: ImageBitmap | undefined;
   let stopped = false;
   let playing = false;
+  const render = async (bytes: Uint8Array<ArrayBuffer>) => {
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+    try {
+      if (stopped) return;
+      draw(options, bitmap, bitmap.width, bitmap.height);
+      if (!playing) {
+        playing = true;
+        options.onState("playing");
+      }
+    } finally {
+      bitmap.close();
+    }
+  };
   options.onState("connecting");
   void fetch(new URL("/video", new URL(options.stream.baseUrl).origin), {
     method: "GET",
@@ -417,33 +457,19 @@ function playMjpeg(options: ViewerOptions) {
       const boundary = multipartBoundary(response.headers.get("content-type"));
       if (!boundary) throw new Error("Device video returned an invalid MJPEG content type");
       reader = response.body.getReader();
-      let pending: Uint8Array<ArrayBufferLike> = new Uint8Array();
+      let pending = new Uint8Array();
       while (!stopped) {
         const next = await reader.read();
         if (next.done) break;
         pending = append(pending, next.value);
         const frames = parseMjpegFrames(pending, boundary);
         pending = frames.rest;
-        for (const bytes of frames.frames) {
-          const nextBitmap = await createImageBitmap(
-            new Blob([new Uint8Array(bytes).buffer], { type: "image/jpeg" }),
-          );
-          bitmap = nextBitmap;
-          try {
-            if (stopped) continue;
-            if (draw(options, nextBitmap, nextBitmap.width, nextBitmap.height) && !playing) {
-              playing = true;
-              options.onState("playing");
-            }
-          } finally {
-            nextBitmap.close();
-            if (bitmap === nextBitmap) bitmap = undefined;
-          }
-        }
+        const bytes = frames.frames.at(-1);
+        if (bytes) await render(bytes);
         if (pending.byteLength > MAX_JPEG_BUFFER)
           throw new Error("Device MJPEG stream exceeded 16 MiB without a complete frame");
       }
-      if (!stopped) options.onState("paused");
+      if (!stopped) throw new Error("Device video stream ended. Refresh devices to retry.");
     })
     .catch((error) => {
       if (!stopped) {
@@ -451,7 +477,9 @@ function playMjpeg(options: ViewerOptions) {
         options.onError(error instanceof Error ? error.message : String(error));
       }
     })
-    .finally(() => {
+    .finally(async () => {
+      abort.abort();
+      await reader?.cancel().catch(() => {});
       reader?.releaseLock();
       reader = undefined;
     });
@@ -460,72 +488,87 @@ function playMjpeg(options: ViewerOptions) {
     stopped = true;
     abort.abort();
     void reader?.cancel().catch(() => {});
-    bitmap?.close();
-    bitmap = undefined;
   };
 }
 
 function draw(options: ViewerOptions, source: CanvasImageSource, width: number, height: number) {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0)
-    return false;
+    throw new Error("Device video produced invalid screen dimensions");
   if (options.canvas.width !== width || options.canvas.height !== height) {
     options.canvas.width = width;
     options.canvas.height = height;
   }
   const context = options.canvas.getContext("2d", { alpha: false });
-  if (!context) return false;
+  if (!context) throw new Error("Device video canvas is unavailable");
   context.drawImage(source, 0, 0, width, height);
-  return true;
 }
 
-function videoSessionSize(value: string) {
+type VideoMessage = { type: "reset" } | { type: "error"; message: string };
+
+function videoMessage(value: string): VideoMessage | undefined {
   try {
     const parsed: unknown = JSON.parse(value);
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      !("type" in parsed) ||
-      parsed.type !== "video-session"
-    )
-      return;
-    if (!("size" in parsed) || !parsed.size || typeof parsed.size !== "object") return;
-    if (!("width" in parsed.size) || !("height" in parsed.size)) return;
-    if (typeof parsed.size.width !== "number" || typeof parsed.size.height !== "number") return;
-    if (!Number.isSafeInteger(parsed.size.width) || !Number.isSafeInteger(parsed.size.height))
-      return;
-    if (parsed.size.width <= 0 || parsed.size.height <= 0) return;
-    return { width: parsed.size.width, height: parsed.size.height };
+    if (!parsed || typeof parsed !== "object") return;
+    if ("ok" in parsed && parsed.ok === false)
+      return {
+        type: "error",
+        message:
+          "error" in parsed && typeof parsed.error === "string"
+            ? parsed.error
+            : "the capture session failed",
+      };
+    if (isVideoSession(parsed)) return { type: "reset" };
   } catch {
     return;
   }
 }
 
-function annexBNals(data: Uint8Array) {
-  const starts: Array<{ readonly code: number; readonly nal: number }> = [];
-  for (let index = 0; index < data.byteLength - 2; index++) {
-    if (data[index] !== 0 || data[index + 1] !== 0) continue;
-    if (data[index + 2] === 1) {
-      starts.push({ code: index, nal: index + 3 });
-      index += 2;
-      continue;
-    }
-    if (index + 3 < data.byteLength && data[index + 2] === 0 && data[index + 3] === 1) {
-      starts.push({ code: index, nal: index + 4 });
-      index += 3;
-    }
-  }
-  return starts.map((start, index) =>
-    data.subarray(start.nal, starts[index + 1]?.code ?? data.byteLength),
+function isVideoSession(message: object): boolean {
+  return (
+    "type" in message &&
+    message.type === "video-session" &&
+    "size" in message &&
+    message.size !== null &&
+    typeof message.size === "object" &&
+    validVideoSize(message.size)
   );
 }
 
-function hasAnnexBStart(data: Uint8Array) {
-  if (data.byteLength >= 4 && data[0] === 0 && data[1] === 0 && data[2] === 1) return true;
-  return data.byteLength >= 5 && data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1;
+function validVideoSize(size: object): boolean {
+  if (!("width" in size) || !("height" in size)) return false;
+  return (
+    typeof size.width === "number" &&
+    typeof size.height === "number" &&
+    Number.isSafeInteger(size.width) &&
+    Number.isSafeInteger(size.height) &&
+    size.width > 0 &&
+    size.height > 0
+  );
 }
 
-function hasNal(data: Uint8Array, type: number) {
-  return annexBNals(data).some((nal) => (nal[0] & 0x1f) === type);
+// Inspect once per packet. An SPS supplies both the codec and keyframe marker, so most keyframes stop at their header.
+function annexBInfo(data: Uint8Array): { key: boolean; codec?: string } {
+  let key = false;
+  for (let index = 0; index < data.byteLength - 2; index++) {
+    const start = nalStart(data, index);
+    if (start === undefined) continue;
+    const type = data[start] & 0x1f;
+    if (type === 7) return { key: true, codec: spsCodec(data.subarray(start, start + 4)) };
+    if (type === 5) key = true;
+    index = start;
+  }
+  return { key };
+}
+
+function nalStart(data: Uint8Array, index: number): number | undefined {
+  if (data[index] !== 0 || data[index + 1] !== 0) return;
+  if (data[index + 2] === 1) return index + 3;
+  if (data[index + 2] === 0 && data[index + 3] === 1) return index + 4;
+}
+
+function spsCodec(sps: Uint8Array): string | undefined {
+  if (sps.byteLength < 4) return;
+  return `avc1.${[sps[1], sps[2], sps[3]].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function append(left: Uint8Array, right: Uint8Array) {

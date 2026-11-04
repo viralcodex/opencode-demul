@@ -1,8 +1,6 @@
 import { Device } from "../rpc.js";
 
-// The runtime's typed failure. Every rejected runtime operation rejects with a {@link DeviceFailure}, so a caller reads
-// a stable {@link Device.DeviceErrorCode}, a human-readable message, and whether the native action may already have run,
-// instead of inspecting an opaque `Error`. `data` is exactly the {@link Device.DeviceError} that crosses the wire.
+// Preserve the error code, message, and dispatch certainty across the device RPC boundary.
 export class DeviceFailure extends Error {
   readonly code: Device.DeviceErrorCode;
   readonly mayHaveExecuted: boolean;
@@ -20,7 +18,7 @@ export class DeviceFailure extends Error {
   }
 }
 
-// Build a {@link DeviceFailure}. `mayHaveExecuted` defaults to false; callers set it true after dispatching a mutation.
+// Mark mutations that were dispatched before failure so callers do not mistake their outcome for a clean cancellation.
 export function deviceError(
   code: Device.DeviceErrorCode,
   message: string,

@@ -2,10 +2,11 @@ import { readFile, access, mkdir, readdir, realpath, rm, writeFile, lstat } from
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, posix, win32, relative, isAbsolute, sep } from "node:path";
+import type { Stats } from "node:fs";
 import { Option, Schema } from "effect";
 import { deviceError } from "./errors.js";
 import { parseJson } from "./json.js";
-import { runCommand } from "./process.js";
+import { runCommand, type CommandResult } from "./process.js";
 import helperPackage from "./helper-package.json" with { type: "json" };
 import helperLock from "./helper-lock.json" with { type: "json" };
 
@@ -52,17 +53,20 @@ async function trustedPath(root: string, path: string): Promise<boolean> {
       throw error;
     });
     if (!metadata) return false;
-    if (
-      metadata.isSymbolicLink() ||
-      (current === path ? !metadata.isFile() : !metadata.isDirectory()) ||
-      (process.getuid && (metadata.uid !== process.getuid() || (metadata.mode & 0o022) !== 0))
-    )
+    if (!secureEntry(metadata, current === path))
       throw deviceError(
         "missing-prerequisite",
         "A device helper path is symlinked or not owned securely by the current user.",
       );
   }
   return true;
+}
+
+function secureEntry(metadata: Stats, file: boolean): boolean {
+  if (metadata.isSymbolicLink()) return false;
+  if (file ? !metadata.isFile() : !metadata.isDirectory()) return false;
+  const uid = process.getuid?.();
+  return uid === undefined || (metadata.uid === uid && (metadata.mode & 0o022) === 0);
 }
 
 export function parseNodeVersion(output: string) {
@@ -132,13 +136,7 @@ export async function ensureHelpers(
     [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter),
   };
   const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env });
-  if (result.code !== 0) {
-    const reason = result.spawnError ?? result.stderr.split("\n").slice(-3).join(" ").trim();
-    throw deviceError(
-      "missing-prerequisite",
-      `Installing the device helpers failed: ${reason || "npm install failed"}`,
-    );
-  }
+  requireInstall(result);
   const resolved = await resolveHelperPaths(dir);
   if (!resolved)
     throw deviceError(
@@ -147,6 +145,15 @@ export async function ensureHelpers(
     );
   await writeFile(stamp, `${HELPER_LOCK_HASH}\n`);
   return resolved;
+}
+
+function requireInstall(result: CommandResult): void {
+  if (result.code === 0) return;
+  const reason = result.spawnError ?? result.stderr.split("\n").slice(-3).join(" ").trim();
+  throw deviceError(
+    "missing-prerequisite",
+    `Installing the device helpers failed: ${reason || "npm install failed"}`,
+  );
 }
 
 // Resolve both helper CLI entry files from an existing install, or null when either is not installed.
@@ -173,27 +180,37 @@ async function resolveBin(dir: string, pkg: keyof typeof PINS): Promise<string |
   const manifest = parseJson(BinManifest, raw);
   if (Option.isNone(manifest) || manifest.value.version !== PINS[pkg]) return null;
   const bin = manifest.value.bin;
-  const relative =
-    typeof bin === "string" ? bin : bin ? (bin[pkg] ?? Object.values(bin)[0]) : undefined;
+  const relative = manifestBin(bin, pkg);
   if (!relative) return null;
   const resolved = join(root, relative);
   return (await trustedPath(root, resolved)) ? resolved : null;
 }
 
+function manifestBin(
+  bin: string | Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  if (typeof bin === "string") return bin;
+  if (bin) return bin[name] ?? Object.values(bin)[0];
+}
+
 // Resolve the external Node binary the helpers run under and verify it meets the automation engine's minimum. The
 // candidate comes from the explicit option, then `OPENCODE_DEVICE_NODE`, then PATH with installed NVM versions as fallback.
 export async function resolveExternalNode(candidate?: string, timeoutMs = 10_000): Promise<string> {
-  const node = candidate ?? process.env["OPENCODE_DEVICE_NODE"] ?? "node";
+  const configured = candidate ?? process.env["OPENCODE_DEVICE_NODE"];
+  try {
+    return await validateExternalNode(configured ?? "node", timeoutMs);
+  } catch (error) {
+    if (configured !== undefined) throw error;
+    const installed = await nvmNodeCandidates(process.env["NVM_DIR"] ?? join(homedir(), ".nvm"));
+    if (installed[0]) return validateExternalNode(installed[0], timeoutMs);
+    throw error;
+  }
+}
+
+async function validateExternalNode(node: string, timeoutMs: number): Promise<string> {
   const result = await runCommand({ command: node, args: ["--version"], timeoutMs });
   const version = parseNodeVersion(result.stdout) ?? parseNodeVersion(result.stderr);
-  if (
-    candidate === undefined &&
-    process.env["OPENCODE_DEVICE_NODE"] === undefined &&
-    (result.code !== 0 || !version || !satisfiesNode(version))
-  ) {
-    const installed = await nvmNodeCandidates(process.env["NVM_DIR"] ?? join(homedir(), ".nvm"));
-    if (installed[0]) return resolveExternalNode(installed[0], timeoutMs);
-  }
   if (result.code !== 0 || !version) {
     const reason = result.spawnError ?? result.stderr.trim();
     throw deviceError(

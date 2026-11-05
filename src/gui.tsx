@@ -16,7 +16,6 @@ import {
 import styles from "./gui.css?inline";
 
 const PANEL_TAB = "device";
-const PLATFORMS: readonly Device.Platform[] = ["android", "ios"];
 
 const firstDevice = (devices: readonly Device.DeviceInfo[]) =>
   devices.find((device) => device.ownership !== "owned-by-other" && device.state === "booted") ??
@@ -128,28 +127,25 @@ export default Plugin.define({
         setSelectedPlatform(current.handle.platform);
         setSelectedDevice(current.selection?.deviceId ?? current.handle.deviceId);
       });
-      const discoveryMessage = () => {
-        if (listing() && !opening() && !attachment()) return "Finding devices...";
-        if (!listing() && !opening() && !attachment() && devices().length === 0)
-          return "No emulators or simulators found.";
-      };
-      const openingMessage = () => {
-        if (!opening()) return;
-        return devices().find((device) => device.id === selectedDevice())?.state === "shutdown"
+      const openingMessage = () =>
+        devices().find((device) => device.id === selectedDevice())?.state === "shutdown"
           ? "Booting up device..."
           : "Connecting to device...";
-      };
-      const screenMessage = () => {
+      const startupMessage = createMemo(() => {
+        if (connectionError() || error()) return;
+        if (opening()) return openingMessage();
+        const current = attachment();
+        if (!current) {
+          if (listing()) return "Finding devices...";
+          if (devices().length === 0) return "No emulators or simulators found.";
+          return;
+        }
         if (
-          attachment()?.capabilities.supported.includes("stream") &&
-          (viewerState() === "idle" || viewerState() === "connecting")
+          current.capabilities.supported.includes("stream") &&
+          ["idle", "connecting"].includes(viewerState())
         ) {
           return "Almost done, preparing the screen...";
         }
-      };
-      const startupMessage = createMemo(() => {
-        if (connectionError() || error()) return;
-        return openingMessage() ?? discoveryMessage() ?? screenMessage();
       });
       let pointerStart:
         | { point: Device.LogicalPoint; frame: ScreenFrame; pointerId: number }
@@ -374,21 +370,18 @@ export default Plugin.define({
       const pointerUp = (event: PointerEvent) => {
         const current = attachment();
         const start = pointerStart;
-        const from = start?.point;
         const to = point(event);
         pointerStart = undefined;
-        const surface = canvas();
         if (
           !current ||
           !start ||
-          !from ||
           !to ||
-          !surface ||
           start.pointerId !== event.pointerId ||
           !sameScreenFrame(start.frame, displayedFrame())
         )
           return;
-        const viewport = { width: surface.width, height: surface.height };
+        const from = start.point;
+        const viewport = { width: start.frame.width, height: start.frame.height };
         const distance = Math.hypot(to.x - from.x, to.y - from.y);
         if (distance < 12) {
           void manual({ type: "tap", handle: current.handle, point: to, viewport });
@@ -396,6 +389,65 @@ export default Plugin.define({
         }
         void manual({ type: "swipe", handle: current.handle, from, to, viewport });
       };
+
+      const Picker = () => (
+        <footer class="device-panel__picker" aria-label="Device selection">
+          <div class="device-panel__platforms" role="group" aria-label="Device platform">
+            <For each={Device.Platform.literals}>
+              {(platform) => (
+                <button
+                  type="button"
+                  class="device-panel__platform"
+                  aria-pressed={selectedPlatform() === platform}
+                  onClick={() => void selectPlatform(platform)}
+                >
+                  {platform === "android" ? "Android" : "iOS"}
+                </button>
+              )}
+            </For>
+          </div>
+          <select
+            class="device-panel__device-select"
+            aria-label="Device"
+            value={platformDevices().find((device) => device.id === selectedDevice())?.id ?? ""}
+            onChange={(event) => void selectDevice(event.currentTarget.value)}
+            disabled={platformDevices().length === 0}
+          >
+            <option value="" disabled>
+              {platformDevices().length ? "Select device" : "No devices"}
+            </option>
+            <For each={platformDevices()}>
+              {(device) => <option value={device.id}>{deviceLabel(device)}</option>}
+            </For>
+          </select>
+          <ctx.ui.Tooltip value="Refresh devices">
+            <button
+              type="button"
+              class="device-panel__action"
+              aria-label="Refresh devices"
+              aria-busy={listing()}
+              onClick={() => void refresh()}
+            >
+              <ctx.ui.Icon name="refresh" size="small" />
+            </button>
+          </ctx.ui.Tooltip>
+          <ctx.ui.Tooltip
+            value={
+              attachment()?.agentAccess
+                ? "Revoke agent access for this session"
+                : "Allow agent access for this session"
+            }
+          >
+            <ctx.ui.Switch
+              label="Agent device access"
+              hideLabel
+              checked={attachment()?.agentAccess ?? false}
+              disabled={!attachment()}
+              onChange={(enabled) => void outcome(() => bridge.access({ scope: scope(), enabled }))}
+            />
+          </ctx.ui.Tooltip>
+        </footer>
+      );
 
       return (
         <section class="device-panel" aria-label="Device controls">
@@ -427,65 +479,7 @@ export default Plugin.define({
               </div>
             </Show>
           </div>
-
-          <footer class="device-panel__picker" aria-label="Device selection">
-            <div class="device-panel__platforms" role="group" aria-label="Device platform">
-              <For each={PLATFORMS}>
-                {(platform) => (
-                  <button
-                    type="button"
-                    class="device-panel__platform"
-                    aria-pressed={selectedPlatform() === platform}
-                    onClick={() => void selectPlatform(platform)}
-                  >
-                    {platform === "android" ? "Android" : "iOS"}
-                  </button>
-                )}
-              </For>
-            </div>
-            <select
-              class="device-panel__device-select"
-              aria-label="Device"
-              value={platformDevices().find((device) => device.id === selectedDevice())?.id ?? ""}
-              onChange={(event) => void selectDevice(event.currentTarget.value)}
-              disabled={platformDevices().length === 0}
-            >
-              <option value="" disabled>
-                {platformDevices().length ? "Select device" : "No devices"}
-              </option>
-              <For each={platformDevices()}>
-                {(device) => <option value={device.id}>{deviceLabel(device)}</option>}
-              </For>
-            </select>
-            <ctx.ui.Tooltip value="Refresh devices">
-              <button
-                type="button"
-                class="device-panel__action"
-                aria-label="Refresh devices"
-                aria-busy={listing()}
-                onClick={() => void refresh()}
-              >
-                <ctx.ui.Icon name="refresh" size="small" />
-              </button>
-            </ctx.ui.Tooltip>
-            <ctx.ui.Tooltip
-              value={
-                attachment()?.agentAccess
-                  ? "Revoke agent access for this session"
-                  : "Allow agent access for this session"
-              }
-            >
-              <ctx.ui.Switch
-                label="Agent device access"
-                hideLabel
-                checked={attachment()?.agentAccess ?? false}
-                disabled={!attachment()}
-                onChange={(enabled) =>
-                  void outcome(() => bridge.access({ scope: scope(), enabled }))
-                }
-              />
-            </ctx.ui.Tooltip>
-          </footer>
+          <Picker />
         </section>
       );
     };

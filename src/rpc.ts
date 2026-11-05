@@ -176,8 +176,8 @@ export const Screenshot = Schema.Struct({
   platform: Platform,
 }).annotate({ identifier: "Device.Screenshot" });
 
-// The stream wire protocol each backend speaks. iOS and Android differ; the viewer decodes the advertised one.
-export const StreamProtocol = Schema.Literals(["mjpeg", "h264"]).annotate({
+// Both platforms expose Annex-B H.264 through the video-only WebSocket proxy.
+export const StreamProtocol = Schema.Literal("h264").annotate({
   identifier: "Device.StreamProtocol",
 });
 export type StreamProtocol = typeof StreamProtocol.Type;

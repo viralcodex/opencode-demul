@@ -1,32 +1,43 @@
-import { describe, expect, jest, test } from "bun:test";
-import {
-  annexBCodec,
-  contentPoint,
-  createViewer,
-  multipartBoundary,
-  parseFramePacket,
-  parseMjpegFrames,
-  sameScreenFrame,
-  screenFrame,
-} from "./viewer.js";
+import { afterEach, describe, expect, jest, test } from "bun:test";
+import { contentPoint, createViewer, sameScreenFrame, screenFrame } from "./viewer.js";
+import { sps, pps, idr, delta, keyframe as annexB } from "../test/video.js";
 
-const annexB = new Uint8Array([0, 0, 0, 1, 0x67, 0x64, 0, 0x29, 0, 0, 1, 0x65, 0x88]);
+const teardown: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of teardown.splice(0).reverse()) cleanup();
+});
 
-function h264Fixture() {
+async function settleDecoder(): Promise<void> {
+  for (let step = 0; step < 4; step++) await Promise.resolve();
+}
+
+function h264Fixture(platform: "android" | "ios" = "android") {
   jest.useFakeTimers();
   const listeners = new Set<EventListener>();
   const checks: Array<ReturnType<typeof Promise.withResolvers<VideoDecoderSupport>>> = [];
+  const chunks: EncodedVideoChunkInit[] = [];
+  const decoders: Decoder[] = [];
+  const sockets: Socket[] = [];
+  const sent: string[] = [];
+  let outputEnabled = true;
+  let framesClosed = 0;
   class Socket extends EventTarget {
     static instance: Socket;
     static OPEN = 1;
     readyState = 1;
     closed = false;
     binaryType = "";
-    constructor() {
+    constructor(
+      readonly url: URL,
+      readonly protocol: string,
+    ) {
       super();
       Socket.instance = this;
+      sockets.push(this);
     }
-    send() {}
+    send(message: string) {
+      sent.push(message);
+    }
     close() {
       this.closed = true;
     }
@@ -42,12 +53,26 @@ function h264Fixture() {
     }
     state = "unconfigured";
     decodeQueueSize = 0;
-    constructor(private readonly callbacks: VideoDecoderInit) {}
+    constructor(private readonly callbacks: VideoDecoderInit) {
+      decoders.push(this);
+    }
     configure() {
       this.state = "configured";
     }
     decode() {
-      this.callbacks.output({ displayWidth: 100, displayHeight: 200, close() {} } as VideoFrame);
+      if (outputEnabled) this.output();
+    }
+    output() {
+      this.callbacks.output({
+        displayWidth: 100,
+        displayHeight: 200,
+        close() {
+          framesClosed++;
+        },
+      } as VideoFrame);
+    }
+    error() {
+      this.callbacks.error(new DOMException("obsolete decoder failure"));
     }
     close() {
       this.state = "closed";
@@ -61,7 +86,11 @@ function h264Fixture() {
     },
     WebSocket: Socket,
     VideoDecoder: Decoder,
-    EncodedVideoChunk: class {},
+    EncodedVideoChunk: class {
+      constructor(input: EncodedVideoChunkInit) {
+        chunks.push(input);
+      }
+    },
   };
   const originals = new Map(
     Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
@@ -78,7 +107,7 @@ function h264Fixture() {
   const viewer = createViewer({
     canvas,
     stream: {
-      platform: "android",
+      platform,
       deviceId: "phone",
       baseUrl: "http://127.0.0.1:3400",
       token: "private-token",
@@ -88,6 +117,14 @@ function h264Fixture() {
     onState: (state) => states.push(state),
     onError: (message) => errors.push(message),
   });
+  teardown.push(() => {
+    viewer.destroy();
+    jest.useRealTimers();
+    for (const [key, original] of originals) {
+      if (original) Object.defineProperty(globalThis, key, original);
+      else Reflect.deleteProperty(globalThis, key);
+    }
+  });
   viewer.active(true);
   return {
     viewer,
@@ -96,91 +133,266 @@ function h264Fixture() {
     canvas,
     listeners,
     checks,
+    chunks,
+    decoders,
+    sent,
+    stall(value: boolean) {
+      outputEnabled = !value;
+    },
+    framesClosed: () => framesClosed,
     socket: Socket.instance,
-    restore() {
-      viewer.destroy();
-      jest.useRealTimers();
-      for (const [key, original] of originals) {
-        if (original) Object.defineProperty(globalThis, key, original);
-        else Reflect.deleteProperty(globalThis, key);
-      }
+    sockets,
+    visibility(state: "visible" | "hidden") {
+      globals.document.visibilityState = state;
+      for (const listener of listeners) listener(new Event("visibilitychange"));
     },
   };
 }
 
-test("unexpected Android video closure is visible instead of a silently blank panel", () => {
-  const item = h264Fixture();
-  try {
+test.each(["android", "ios"] as const)(
+  "%s uses the same authenticated H.264 viewer",
+  (platform) => {
+    const item = h264Fixture(platform);
+    expect(item.socket.url.toString()).toBe("ws://127.0.0.1:3400/video?frame-meta=1");
+    expect(item.socket.protocol).toBe("opencode-device.private-token");
+  },
+);
+
+describe("H.264 viewer", () => {
+  test.each([
+    {
+      name: "separate configuration",
+      packets: [sps, pps, delta],
+      expected: new Uint8Array([...sps, 0, ...pps, ...idr]),
+    },
+    { name: "SPS plus delta", packets: [new Uint8Array([...sps, ...delta])], expected: annexB },
+  ])(
+    "$name waits for an IDR and includes cached parameters in its decoder data",
+    async ({ packets, expected }) => {
+      const item = h264Fixture();
+      for (const data of packets) item.socket.emit("message", { data: data.slice().buffer });
+      expect(item.checks).toHaveLength(0);
+      expect(item.chunks).toHaveLength(0);
+      item.socket.emit("message", { data: idr.slice().buffer });
+      item.checks[0]!.resolve({ supported: true });
+      await settleDecoder();
+      expect(item.chunks).toHaveLength(1);
+      expect(item.chunks[0]).toMatchObject({ type: "key", data: expected });
+      expect(item.states.at(-1)).toBe("playing");
+    },
+  );
+
+  test("dropped packets during asynchronous setup request a new IDR instead of decoding dependent deltas", async () => {
+    const item = h264Fixture();
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.socket.emit("message", { data: delta.slice().buffer });
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    expect(item.checks).toHaveLength(1);
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    expect(item.sent).toHaveLength(1);
+    expect(JSON.parse(item.sent[0]!)).toEqual({ type: "reset-video", ack: false });
+    item.socket.emit("message", { data: delta.slice().buffer });
+    expect(item.chunks).toHaveLength(1);
+    item.socket.emit("message", { data: idr.slice().buffer });
+    expect(item.chunks).toHaveLength(2);
+    expect(item.checks).toHaveLength(1);
+  });
+
+  test("decoder backlog resets playback and rejects deltas until an IDR arrives", async () => {
+    const item = h264Fixture();
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    const previous = item.decoders[0]!;
+    previous.decodeQueueSize = 3;
+    item.socket.emit("message", { data: delta.slice().buffer });
+    expect(previous.state).toBe("closed");
+    expect(item.states.at(-1)).toBe("connecting");
+    const closed = item.framesClosed();
+    previous.output();
+    previous.error();
+    expect(item.errors).toEqual([]);
+    expect(item.framesClosed()).toBe(closed + 1);
+    expect(item.states.at(-1)).toBe("connecting");
+    item.socket.emit("message", { data: delta.slice().buffer });
+    expect(item.chunks).toHaveLength(1);
+    item.socket.emit("message", { data: idr.slice().buffer });
+    item.checks[1]!.resolve({ supported: true });
+    await settleDecoder();
+    expect(item.states.at(-1)).toBe("playing");
+    expect(item.chunks.at(-1)!.type).toBe("key");
+  });
+
+  test("a running decoder stall requests recovery and then reports a bounded failure", async () => {
+    const item = h264Fixture();
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    item.stall(true);
+    item.socket.emit("message", { data: delta.slice().buffer });
+    jest.advanceTimersByTime(14_999);
+    item.socket.emit("message", { data: delta.slice().buffer });
+    jest.advanceTimersByTime(1);
+    expect(item.states.at(-1)).toBe("connecting");
+    expect(item.sent).toHaveLength(1);
+    expect(item.decoders[0]!.state).toBe("closed");
+    jest.advanceTimersByTime(15_000);
+    expect(item.states.at(-1)).toBe("paused");
+    expect(item.errors).toHaveLength(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test("a static screen with no submitted video does not trigger a stall timeout", async () => {
+    const item = h264Fixture();
+    item.socket.emit("message", { data: annexB.slice().buffer });
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    jest.advanceTimersByTime(60_000);
+    expect(item.states.at(-1)).toBe("playing");
+    expect(item.errors).toEqual([]);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test("unexpected video closure is visible instead of a silently blank panel", () => {
+    const item = h264Fixture();
     item.socket.emit("close", { code: 1006 });
     expect(item.states).toEqual(["connecting", "paused"]);
     expect(item.errors[0]).toContain("connection closed (code 1006)");
     expect(jest.getTimerCount()).toBe(0);
-  } finally {
-    item.restore();
-  }
-});
+  });
 
-test("Android video startup has a deadline and stops failed connections", () => {
-  const item = h264Fixture();
-  try {
+  test("video startup has a deadline and stops failed connections", () => {
+    const item = h264Fixture();
     jest.advanceTimersByTime(15_000);
     expect(item.errors[0]).toContain("within 15 seconds");
     expect(item.socket.closed).toBe(true);
     expect(item.states.at(-1)).toBe("paused");
     expect(jest.getTimerCount()).toBe(0);
-  } finally {
-    item.restore();
-  }
-});
+  });
 
-test("Android backend errors are shown once and redact the stream token", () => {
-  const item = h264Fixture();
-  try {
+  test("backend errors are shown once and redact the stream token", () => {
+    const item = h264Fixture();
     item.socket.emit("message", {
       data: JSON.stringify({ ok: false, error: "capture failed private-token" }),
     });
     item.socket.emit("close", { code: 1006 });
-    expect(item.errors).toEqual(["Android video failed: capture failed [redacted]"]);
+    expect(item.errors).toEqual(["Device video failed: capture failed [redacted]"]);
     expect(item.socket.closed).toBe(true);
-  } finally {
-    item.restore();
-  }
-});
+  });
 
-test("Android ignores stale decoder checks, renders the current frame, and releases viewer resources", async () => {
-  const item = h264Fixture();
-  try {
-    item.socket.emit("message", { data: annexB.slice().buffer });
-    item.socket.emit("message", {
-      data: JSON.stringify({ type: "video-session", size: { width: 100, height: 200 } }),
-    });
-    item.socket.emit("message", { data: annexB.slice().buffer });
-    item.checks[0].reject(new Error("obsolete codec check"));
-    item.checks[1].resolve({ supported: true });
-    await Promise.resolve();
-    expect(item.states).toEqual(["connecting", "playing"]);
-    expect(item.canvas.width).toBe(100);
-    expect(item.canvas.height).toBe(200);
+  test.each([
+    { trigger: "session", phase: "configuring" },
+    { trigger: "session", phase: "playing" },
+    { trigger: "codec", phase: "configuring" },
+    { trigger: "codec", phase: "playing" },
+  ])(
+    "$trigger replacement during $phase invalidates the previous decoder generation",
+    async ({ trigger, phase }) => {
+      const item = h264Fixture();
+      item.socket.emit("message", { data: annexB.buffer });
+      if (phase === "playing") {
+        item.checks[0]!.resolve({ supported: true });
+        await settleDecoder();
+      }
+      if (trigger === "session") {
+        item.socket.emit("message", {
+          data: JSON.stringify({ type: "video-session", size: { width: 100, height: 200 } }),
+        });
+        item.socket.emit("message", { data: annexB.buffer });
+      } else {
+        item.socket.emit("message", {
+          data: new Uint8Array([...sps.slice(0, 5), 0x4d, 0, 0x1f, ...idr]).buffer,
+        });
+      }
+      expect(item.checks).toHaveLength(2);
+      expect(jest.getTimerCount()).toBe(1);
+      if (phase === "playing") {
+        expect(item.decoders[0]!.state).toBe("closed");
+        item.decoders[0]!.error();
+      } else if (trigger === "session") item.checks[0]!.reject(new Error("obsolete codec check"));
+      else item.checks[0]!.resolve({ supported: true });
+      item.checks[1]!.resolve({ supported: true });
+      await settleDecoder();
+      expect(item.decoders).toHaveLength(phase === "playing" ? 2 : 1);
+      expect(item.states).toEqual(
+        phase === "playing"
+          ? ["connecting", "playing", "connecting", "playing"]
+          : ["connecting", "playing"],
+      );
+      expect(item.canvas).toMatchObject({ width: 100, height: 200 });
+      expect(jest.getTimerCount()).toBe(0);
+      expect(item.errors).toEqual([]);
+    },
+  );
+
+  test.each(["unsupported", "rejected"])(
+    "a %s codec check stops startup and reports one error",
+    async (failure) => {
+      const item = h264Fixture();
+      item.socket.emit("message", { data: annexB.buffer });
+      if (failure === "unsupported") item.checks[0]!.resolve({ supported: false });
+      else item.checks[0]!.reject(new Error("codec check failed"));
+      await settleDecoder();
+      expect(item.errors).toHaveLength(1);
+      expect(item.states.at(-1)).toBe("paused");
+      expect(item.socket.closed).toBe(true);
+      expect(item.decoders).toHaveLength(0);
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  test("hiding the page releases capture and ignores a pending codec check", async () => {
+    const item = h264Fixture();
+    item.socket.emit("message", { data: annexB.buffer });
+    item.visibility("hidden");
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    expect(item.socket.closed).toBe(true);
+    expect(item.states.at(-1)).toBe("paused");
+    expect(item.decoders).toHaveLength(0);
     expect(jest.getTimerCount()).toBe(0);
-    expect(item.errors).toEqual([]);
-    expect(item.listeners.size).toBe(1);
-    item.socket.emit("message", {
-      data: JSON.stringify({ type: "video-session", size: { width: 100, height: 200 } }),
-    });
-    expect(jest.getTimerCount()).toBe(1);
-    item.socket.emit("message", { data: annexB.slice().buffer });
-    item.checks[2].resolve({ supported: true });
-    await Promise.resolve();
+    item.visibility("visible");
+    expect(item.states.at(-1)).toBe("connecting");
+  });
+
+  test("a failed canvas draw closes the output frame and decoder", async () => {
+    const item = h264Fixture();
+    item.canvas.getContext = () => null;
+    item.socket.emit("message", { data: annexB.buffer });
+    item.checks[0]!.resolve({ supported: true });
+    await settleDecoder();
+    expect(item.framesClosed()).toBe(1);
+    expect(item.decoders[0]!.state).toBe("closed");
+    expect(item.errors[0]).toContain("canvas is unavailable");
     expect(jest.getTimerCount()).toBe(0);
-    item.viewer.destroy();
-    expect(item.canvas.width).toBe(0);
-    expect(item.canvas.height).toBe(0);
-    expect(item.listeners.size).toBe(0);
-    item.socket.emit("close", { code: 1006 });
-    expect(item.errors).toEqual([]);
-  } finally {
-    item.restore();
-  }
+  });
+
+  test.each(["configuring", "playing"])(
+    "destroying a %s viewer is terminal and releases its resources",
+    async (phase) => {
+      const item = h264Fixture();
+      item.socket.emit("message", { data: annexB.buffer });
+      if (phase === "playing") {
+        item.checks[0]!.resolve({ supported: true });
+        await settleDecoder();
+      }
+      item.viewer.destroy();
+      item.viewer.active(true);
+      item.visibility("visible");
+      if (phase === "configuring") item.checks[0]!.resolve({ supported: true });
+      await settleDecoder();
+      expect(item.sockets).toHaveLength(1);
+      expect(item.decoders).toHaveLength(phase === "playing" ? 1 : 0);
+      if (phase === "playing") expect(item.decoders[0]!.state).toBe("closed");
+      expect(item.states.at(-1)).toBe("idle");
+      expect(item.listeners.size).toBe(0);
+      expect(item.canvas).toMatchObject({ width: 0, height: 0 });
+      item.socket.emit("close", { code: 1006 });
+      expect(item.errors).toEqual([]);
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
 });
 
 test("screen input requires a current rendered frame and rejects a changed gesture target", () => {
@@ -197,95 +409,6 @@ test("screen input requires a current rendered frame and rejects a changed gestu
   expect(sameScreenFrame(first, { ...first, width: 200 })).toBe(false);
   expect(sameScreenFrame(first, { ...first, height: 400 })).toBe(false);
   expect(sameScreenFrame(first, first)).toBe(true);
-});
-
-describe("parseFramePacket", () => {
-  test("parses raw Annex-B and detects an IDR keyframe", () => {
-    const packet = parseFramePacket(annexB.slice().buffer);
-    expect(packet?.bytes).toEqual(annexB);
-    expect(packet?.key).toBe(true);
-    expect(packet?.timestamp).toBeGreaterThan(0);
-  });
-
-  test("parses SEMU v1 metadata", () => {
-    const data = framed(1, 1, 123_456n, annexB);
-    const packet = parseFramePacket(data.buffer);
-    expect(packet).toEqual({
-      bytes: data.subarray(16),
-      key: true,
-      codec: "avc1.640029",
-      timestamp: 123_456,
-      serverTimestamp: undefined,
-    });
-  });
-
-  test("parses the v2 server timestamp without treating it as dimensions", () => {
-    const data = framed(2, 0, 222n, annexB, 1_735_689_600_123_000n);
-    const packet = parseFramePacket(data.buffer);
-    expect(packet).toEqual({
-      bytes: data.subarray(24),
-      key: true,
-      codec: "avc1.640029",
-      timestamp: 222,
-      serverTimestamp: 1_735_689_600_123,
-    });
-  });
-
-  test.each([
-    new Uint8Array(),
-    new Uint8Array([0, 0, 0, 1]),
-    framed(3, 0, 1n, annexB),
-    framed(2, 0, 1n, new Uint8Array()),
-    framed(1, 0, BigInt(Number.MAX_SAFE_INTEGER) + 1n, annexB),
-    new Uint8Array([0x53, 0x45, 0x4d, 0x55, 1]),
-  ])("rejects malformed framing", (data) => {
-    expect(parseFramePacket(data.buffer)).toBeUndefined();
-  });
-});
-
-test("annexBCodec reads an SPS across mixed start-code boundaries", () => {
-  expect(
-    annexBCodec(
-      new Uint8Array([0, 0, 0, 1, 0x68, 1, 2, 0, 0, 1, 0x67, 0x64, 0, 0x29, 0, 0, 0, 1, 0x65]),
-    ),
-  ).toBe("avc1.640029");
-});
-
-describe("MJPEG multipart framing", () => {
-  test("reads the boundary and a Content-Length framed JPEG across chunks", () => {
-    expect(multipartBoundary('multipart/x-mixed-replace; boundary="frame"')).toBe("frame");
-    const first = join(
-      new TextEncoder().encode("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n"),
-      new Uint8Array([0xff, 0xd8]),
-    );
-    const second = new Uint8Array([0xff, 0xd9, 13, 10]);
-    const partial = parseMjpegFrames(first, "frame");
-    expect(partial.frames).toEqual([]);
-    const complete = parseMjpegFrames(join(partial.rest, second), "frame");
-    expect(complete.frames).toEqual([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])]);
-  });
-
-  test.each([
-    null,
-    "image/jpeg",
-    "multipart/x-mixed-replace",
-    "multipart/x-mixed-replace; boundary=\r\ninvalid",
-  ])("rejects malformed content types", (contentType) => {
-    expect(multipartBoundary(contentType)).toBeUndefined();
-  });
-
-  test("does not emit malformed parts", () => {
-    const malformed = new TextEncoder().encode(
-      "--frame\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\nnope\r\n",
-    );
-    const validHeader = new TextEncoder().encode(
-      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n",
-    );
-    const data = join(join(malformed, validHeader), new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
-    expect(parseMjpegFrames(data, "frame").frames).toEqual([
-      new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
-    ]);
-  });
 });
 
 describe("contentPoint", () => {
@@ -311,29 +434,3 @@ describe("contentPoint", () => {
     expect(contentPoint(nextBounds, nextSize, { x: 100, y: 100 })).toBeUndefined();
   });
 });
-
-function framed(
-  version: number,
-  flags: number,
-  pts: bigint,
-  payload: Uint8Array,
-  serverTimestamp = 0n,
-) {
-  const header = version === 2 ? 24 : 16;
-  const data = new Uint8Array(header + payload.byteLength);
-  const view = new DataView(data.buffer);
-  view.setUint32(0, 0x53454d55);
-  view.setUint8(4, version);
-  view.setUint8(5, flags);
-  view.setBigUint64(8, pts);
-  if (version === 2) view.setBigUint64(16, serverTimestamp);
-  data.set(payload, header);
-  return data;
-}
-
-function join(left: Uint8Array, right: Uint8Array) {
-  const data = new Uint8Array(left.byteLength + right.byteLength);
-  data.set(left);
-  data.set(right, left.byteLength);
-  return data;
-}

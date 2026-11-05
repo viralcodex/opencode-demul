@@ -29,7 +29,8 @@ Add this entry to your OpenCode configuration.
 
 Open **Add tab > Device** in a session.
 First use downloads the pinned device helpers from npm.
-Android SDK tools and Node must already be installed. Android video uses the device's H.264 encoder through scrcpy.
+Android SDK tools and Node must already be installed. Both platforms stream H.264 through a shared viewer.
+Android uses the device's encoder through scrcpy; iOS uses the simulator helper's native encoder.
 
 ## Use
 

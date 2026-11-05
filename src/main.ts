@@ -25,7 +25,7 @@ interface Connection {
   requests: Map<string, AbortController>;
   stopEvents: () => void;
   closed: boolean;
-  proxy?: { token: string; pending: Promise<StreamProxy> };
+  proxy?: { token: string; sourceToken: string; pending: Promise<StreamProxy> };
 }
 
 export function createMainSetup(
@@ -316,11 +316,16 @@ export function createMainSetup(
         return deviceStreamOutcome(async () => {
           const raw = await getController().stream(caller(connection), input.handle);
           requireStream(connection, input, ipcCaller.window, ipcCaller.signal);
-          if (connection.proxy && connection.proxy.token !== input.handle.token)
+          if (
+            connection.proxy &&
+            (connection.proxy.token !== input.handle.token ||
+              connection.proxy.sourceToken !== raw.token)
+          )
             await stopProxy(connection);
           if (!connection.proxy) {
             const proxy = {
               token: input.handle.token,
+              sourceToken: raw.token,
               pending: startStreamProxy(raw),
             };
             connection.proxy = proxy;

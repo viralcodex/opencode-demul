@@ -183,7 +183,7 @@ var Screenshot = Schema.Struct({
   deviceId: short,
   platform: Platform
 }).annotate({ identifier: "Device.Screenshot" });
-var StreamProtocol = Schema.Literals(["mjpeg", "h264"]).annotate({
+var StreamProtocol = Schema.Literal("h264").annotate({
   identifier: "Device.StreamProtocol"
 });
 var StreamDescriptor = Schema.Struct({

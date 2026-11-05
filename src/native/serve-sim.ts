@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 import type { Device } from "../rpc.js";
-import { deviceError } from "./errors.js";
+import { cancellationError, deviceError } from "./errors.js";
 
 // The hub's vendored serve-sim routes for an iOS Simulator. Manual input goes over its HID WebSocket: each message is one
 // tag byte followed by UTF-8 JSON, and touch coordinates are normalized to the 0..1 screen surface, not pixels.
@@ -78,20 +78,35 @@ export function swipeEvents(from: ScreenPoint, to: ScreenPoint, steps = SWIPE_ST
   return [{ type: "begin", ...from }, ...moves, { type: "end", ...to }];
 }
 
-export function tap(stream: Device.StreamDescriptor, point: ScreenPoint): Promise<void> {
-  return sendTouches(stream, tapEvents(point), TAP_HOLD_MS);
+export function tap(
+  stream: Device.StreamDescriptor,
+  point: ScreenPoint,
+  signal?: AbortSignal,
+): Promise<void> {
+  return sendTouches(stream, tapEvents(point), TAP_HOLD_MS, undefined, signal);
 }
 
 export function swipe(
   stream: Device.StreamDescriptor,
   from: ScreenPoint,
   to: ScreenPoint,
+  signal?: AbortSignal,
 ): Promise<void> {
-  return sendTouches(stream, swipeEvents(from, to), SWIPE_DURATION_MS / SWIPE_STEPS);
+  return sendTouches(
+    stream,
+    swipeEvents(from, to),
+    SWIPE_DURATION_MS / SWIPE_STEPS,
+    undefined,
+    signal,
+  );
 }
 
-export function pressButton(stream: Device.StreamDescriptor, button: HidButton): Promise<void> {
-  return sendHid(stream, [encodeButton(button)], 0, "button press");
+export function pressButton(
+  stream: Device.StreamDescriptor,
+  button: HidButton,
+  signal?: AbortSignal,
+): Promise<void> {
+  return sendHid(stream, [encodeButton(button)], 0, "button press", undefined, signal);
 }
 
 // Send touch events over one short-lived HID socket, spacing them so the simulator sees a real gesture.
@@ -100,8 +115,9 @@ export function sendTouches(
   events: readonly TouchEvent[],
   intervalMs: number,
   openTimeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
-  return sendHid(stream, events.map(encodeTouch), intervalMs, "touch input", openTimeoutMs);
+  return sendHid(stream, events.map(encodeTouch), intervalMs, "touch input", openTimeoutMs, signal);
 }
 
 async function sendHid(
@@ -110,33 +126,60 @@ async function sendHid(
   intervalMs: number,
   action: string,
   openTimeoutMs = 10_000,
+  signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted();
   const url = helperUrl(stream, "ws");
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(url, [`serve-sim.token.${stream.token}`]);
   // Errors surface through `opened` and `send`; this keeps a late socket error from becoming an uncaught event.
   socket.on("error", () => undefined);
   let sent = 0;
+  const abort = () => socket.terminate();
+  signal?.addEventListener("abort", abort, { once: true });
   try {
-    await opened(socket, openTimeoutMs);
-    for (const message of messages) {
-      if (sent > 0) await delay(intervalMs);
-      await send(socket, message);
-      sent++;
-    }
-    await delay(HID_SETTLE_MS);
+    await opened(socket, openTimeoutMs, signal);
+    await sendMessages(socket, messages, intervalMs, () => sent++, signal);
+    await delay(HID_SETTLE_MS, undefined, { signal });
   } catch (error) {
-    const detail =
-      error instanceof Error ? error.message.replaceAll(stream.token, "[redacted]") : "";
-    throw deviceError(
-      "helper-failed",
-      `The simulator did not accept the ${action}${detail ? `: ${detail}` : "."}`,
-      sent > 0,
-    );
+    throw hidFailure(error, stream.token, action, sent, signal);
   } finally {
+    signal?.removeEventListener("abort", abort);
     if (socket.readyState === WebSocket.OPEN) socket.close(1000);
     else socket.terminate();
   }
+}
+
+async function sendMessages(
+  socket: WebSocket,
+  messages: readonly Buffer[],
+  intervalMs: number,
+  onSend: () => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (const [index, message] of messages.entries()) {
+    signal?.throwIfAborted();
+    if (index > 0) await delay(intervalMs, undefined, { signal });
+    if (socket.readyState !== WebSocket.OPEN) throw new Error("the HID socket closed");
+    onSend();
+    await send(socket, message);
+  }
+}
+
+function hidFailure(
+  error: unknown,
+  token: string,
+  action: string,
+  sent: number,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) return cancellationError(signal, sent > 0);
+  const detail = error instanceof Error ? error.message.replaceAll(token, "[redacted]") : "";
+  return deviceError(
+    "helper-failed",
+    `The simulator did not accept the ${action}${detail ? `: ${detail}` : "."}`,
+    sent > 0,
+  );
 }
 
 // The hub reports ready before native capture starts; poll the screen config until the simulator display is served.
@@ -149,17 +192,9 @@ export async function waitForScreen(
   const url = helperUrl(stream, "config");
   while (Date.now() < deadline) {
     signal?.throwIfAborted();
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${stream.token}` },
-      redirect: "error",
-      signal: AbortSignal.any([
-        AbortSignal.timeout(Math.max(1, Math.min(5_000, deadline - Date.now()))),
-        ...(signal ? [signal] : []),
-      ]),
-    }).catch(() => null);
-    await response?.body?.cancel().catch(() => undefined);
+    const available = await screenAvailable(url, stream.token, deadline - Date.now(), signal);
     signal?.throwIfAborted();
-    if (response?.ok) return;
+    if (available) return;
     await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())), undefined, { signal });
   }
   throw deviceError(
@@ -168,7 +203,25 @@ export async function waitForScreen(
   );
 }
 
-function opened(socket: WebSocket, timeoutMs: number): Promise<void> {
+async function screenAvailable(
+  url: URL,
+  token: string,
+  remainingMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    redirect: "error",
+    signal: AbortSignal.any([
+      AbortSignal.timeout(Math.max(1, Math.min(5_000, remainingMs))),
+      ...(signal ? [signal] : []),
+    ]),
+  }).catch(() => null);
+  await response?.body?.cancel().catch(() => undefined);
+  return response?.ok === true;
+}
+
+function opened(socket: WebSocket, timeoutMs: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => fail(new Error("the HID socket did not open in time")),
@@ -178,7 +231,9 @@ function opened(socket: WebSocket, timeoutMs: number): Promise<void> {
       clearTimeout(timer);
       socket.off("open", succeed);
       socket.off("error", fail);
+      socket.off("close", closed);
       socket.off("unexpected-response", rejected);
+      signal?.removeEventListener("abort", cancelled);
     };
     const succeed = () => {
       cleanup();
@@ -190,15 +245,22 @@ function opened(socket: WebSocket, timeoutMs: number): Promise<void> {
     };
     const rejected = (_request: unknown, response: { statusCode?: number }) =>
       fail(new Error(`the HID socket was refused (HTTP ${response.statusCode ?? "unknown"})`));
+    const closed = () => fail(new Error("the HID socket closed before it opened"));
+    const cancelled = () => {
+      cleanup();
+      reject(signal?.reason);
+    };
     socket.once("open", succeed);
     socket.once("error", fail);
+    socket.once("close", closed);
     socket.once("unexpected-response", rejected);
+    signal?.addEventListener("abort", cancelled, { once: true });
+    if (signal?.aborted) cancelled();
   });
 }
 
 function send(socket: WebSocket, data: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (socket.readyState !== WebSocket.OPEN) return reject(new Error("the HID socket closed"));
     socket.send(data, { binary: true }, (error) => (error ? reject(error) : resolve()));
   });
 }

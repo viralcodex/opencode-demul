@@ -223,6 +223,27 @@ test("native commands leave the event loop responsive and cancellation kills the
   ).rejects.toBe(reason);
 });
 
+test("failed process stops are shared while pending but can be retried after the deadline", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  const signals: NodeJS.Signals[] = [];
+  const child: LongRunningProcess = {
+    pid: undefined,
+    exited: exited.promise,
+    stop: (signal = "SIGTERM") => {
+      signals.push(signal);
+    },
+  };
+  const first = stopProcess(child, 1, 1);
+  expect(stopProcess(child, 1, 1)).toBe(first);
+  await expect(first).rejects.toMatchObject({ code: "timeout" });
+  const retry = stopProcess(child, 1, 1);
+  expect(retry).not.toBe(first);
+  exited.resolve({ code: 0, signal: null });
+  await retry;
+  expect(signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
+  expect(stopProcess(child)).toBe(retry);
+});
+
 test("cancelling Android startup terminates only the emulator it spawned", async () => {
   const abort = new AbortController();
   const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
@@ -750,6 +771,78 @@ test("hub startup rollback awaits bounded forced termination", async () => {
   expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
 });
 
+test("a startup cleanup timeout retains a retryable stop rather than losing the helper", async () => {
+  const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
+  let retained: (() => Promise<void>) | undefined;
+  const signals: NodeJS.Signals[] = [];
+  await expect(
+    startHub(
+      {
+        externalNode: "fixture-node",
+        hubCli: "fixture-hub",
+        platform: "android",
+        deviceId: "fixture-device",
+        readyTimeoutMs: 1,
+        stopGraceMs: 1,
+        stopKillMs: 1,
+        onCleanupFailure: (stop) => {
+          retained = stop;
+        },
+      },
+      () => ({
+        pid: undefined,
+        exited: exited.promise,
+        stop: (signal = "SIGTERM") => {
+          signals.push(signal);
+        },
+      }),
+    ),
+  ).rejects.toMatchObject({ code: "timeout" });
+  expect(retained).toBeDefined();
+  const retry = retained!();
+  exited.resolve({ code: 0, signal: null });
+  await retry;
+  expect(signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
+});
+
+test.each(["AbortError", "TimeoutError"])(
+  "Android gesture cancellation during response capture preserves execution uncertainty: %s",
+  async (name) => {
+    const received = Promise.withResolvers<void>();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        received.resolve();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("{"));
+            },
+          }),
+        );
+      },
+    });
+    const stream = streamDescriptor(
+      { baseUrl: server.url.origin, token: "fixture-secret" },
+      "android",
+      "phone",
+    );
+    try {
+      const abort = new AbortController();
+      const pending = sendGesture(stream, { type: "tap", x: 0.5, y: 0.5 }, abort.signal);
+      const outcome = pending.catch((error: unknown) => error);
+      await received.promise;
+      abort.abort(new DOMException("cancelled", name));
+      expect(await outcome).toMatchObject({
+        data: { code: name === "TimeoutError" ? "timeout" : "detached", mayHaveExecuted: true },
+      });
+    } finally {
+      await server.stop(true);
+    }
+  },
+);
+
 test("unobserved process exit releases resources and reports a bounded timeout", async () => {
   const signals: NodeJS.Signals[] = [];
   let released = false;
@@ -825,7 +918,7 @@ test("an explicit unsupported Node runtime is not replaced by automatic discover
   });
 });
 
-test("hub arg builder pins host, token, the platform's served transport, platform, and single device", () => {
+test("hub arg builder pins host, token, H.264, platform, and single device", () => {
   const android = hubArgs({
     externalNode: "node",
     hubCli: "/h/cli.js",
@@ -852,8 +945,9 @@ test("hub arg builder pins host, token, the platform's served transport, platfor
     platform: "ios",
     deviceId: "UDID",
   });
-  expect(ios).toContain("mjpeg");
-  expect(ios).not.toContain("h264");
+  expect(ios).toContain("h264");
+  expect(ios).not.toContain("mjpeg");
+  expect(ios).not.toContain("scrcpy");
 });
 
 test("parseReady extracts a loopback origin and token", () => {

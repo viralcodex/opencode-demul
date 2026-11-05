@@ -132,6 +132,9 @@ export function stopProcess(
   };
   const result = stop();
   stopping.set(process, result);
+  void result.catch(() => {
+    if (stopping.get(process) === result) stopping.delete(process);
+  });
   return result;
 }
 

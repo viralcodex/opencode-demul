@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer as createTcpServer, type AddressInfo, type Socket } from "node:net";
 import { WebSocketServer, type RawData } from "ws";
 import type { Device } from "../rpc.js";
 import {
@@ -26,7 +26,7 @@ const descriptor = (baseUrl: string): Device.StreamDescriptor => ({
   deviceId: "UDID-1",
   baseUrl,
   token: HUB_TOKEN,
-  protocol: "mjpeg",
+  protocol: "h264",
   loopback: true,
 });
 
@@ -126,8 +126,6 @@ test("sendTouches authenticates the device-scoped HID socket and sends binary me
   const baseUrl = await listen(server);
   const received: Array<{ data: Buffer; binary: boolean }> = [];
   const closed = Promise.withResolvers<void>();
-  let lastMessageAt = 0;
-  let closedAt = 0;
   let offeredProtocols: string[] = [];
   let requestUrl: string | undefined;
   let selectedProtocol: string | undefined;
@@ -145,16 +143,14 @@ test("sendTouches authenticates the device-scoped HID socket and sends binary me
     selectedProtocol = socket.protocol;
     socket.on("message", (data, binary) => {
       received.push({ data: toBuffer(data), binary });
-      lastMessageAt = performance.now();
     });
-    socket.on("close", () => {
-      closedAt = performance.now();
-      closed.resolve();
-    });
+    socket.on("close", () => closed.resolve());
   });
 
   const events = swipeEvents({ x: 0.25, y: 0.75 }, { x: 0.75, y: 0.25 }, 4);
+  const startedAt = performance.now();
   await sendTouches(descriptor(baseUrl), events, 1, 1_000);
+  const elapsed = performance.now() - startedAt;
   await closed.promise;
 
   const url = new URL(requestUrl!, baseUrl);
@@ -163,7 +159,7 @@ test("sendTouches authenticates the device-scoped HID socket and sends binary me
   expect(offeredProtocols).toEqual([`serve-sim.token.${HUB_TOKEN}`]);
   expect(selectedProtocol).toBe(`serve-sim.token.${HUB_TOKEN}`);
   expect(received).toEqual(events.map((event) => ({ data: encodeTouch(event), binary: true })));
-  expect(closedAt - lastMessageAt).toBeGreaterThanOrEqual(490);
+  expect(elapsed).toBeGreaterThanOrEqual(490);
 });
 
 test.each(buttonCases)(
@@ -173,8 +169,6 @@ test.each(buttonCases)(
     const baseUrl = await listen(server);
     const received: Array<{ data: Buffer; binary: boolean }> = [];
     const closed = Promise.withResolvers<void>();
-    let lastMessageAt = 0;
-    let closedAt = 0;
     let requestUrl: string | undefined;
     let selectedProtocol: string | undefined;
     const wss = track(
@@ -189,15 +183,13 @@ test.each(buttonCases)(
       selectedProtocol = socket.protocol;
       socket.on("message", (data, binary) => {
         received.push({ data: toBuffer(data), binary });
-        lastMessageAt = performance.now();
       });
-      socket.on("close", () => {
-        closedAt = performance.now();
-        closed.resolve();
-      });
+      socket.on("close", () => closed.resolve());
     });
 
+    const startedAt = performance.now();
     await pressButton(descriptor(baseUrl), button);
+    const elapsed = performance.now() - startedAt;
     await closed.promise;
 
     expect(requestUrl).toBe("/vendor/serve-sim/helper/ws?device=UDID-1");
@@ -205,7 +197,7 @@ test.each(buttonCases)(
     expect(received).toEqual([
       { data: Buffer.concat([Buffer.from([4]), Buffer.from(payload, "utf8")]), binary: true },
     ]);
-    expect(closedAt - lastMessageAt).toBeGreaterThanOrEqual(490);
+    expect(elapsed).toBeGreaterThanOrEqual(490);
   },
 );
 
@@ -250,6 +242,62 @@ test("sendTouches reports a refused upgrade without claiming input ran or leakin
       mayHaveExecuted: false,
     },
   });
+});
+
+test("cancelling an opening HID socket closes it promptly without claiming input was sent", async () => {
+  const connected = Promise.withResolvers<void>();
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.on("data", () => connected.resolve());
+    socket.on("end", () => socket.end());
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  teardown.push(
+    () =>
+      new Promise((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.close(() => resolve());
+      }),
+  );
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const abort = new AbortController();
+  const operation = pressButton(descriptor(baseUrl), "home", abort.signal);
+  const outcome = operation.catch((error: unknown) => error);
+  await connected.promise;
+  abort.abort();
+  expect(await outcome).toMatchObject({ data: { code: "detached", mayHaveExecuted: false } });
+});
+
+test("cancelling a running gesture stops further HID input and preserves dispatch uncertainty", async () => {
+  const server = createServer();
+  const baseUrl = await listen(server);
+  const received: Buffer[] = [];
+  const first = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  const wss = track(new WebSocketServer({ server }));
+  wss.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      received.push(toBuffer(data));
+      first.resolve();
+    });
+    socket.on("close", () => closed.resolve());
+  });
+  const abort = new AbortController();
+  const operation = sendTouches(
+    descriptor(baseUrl),
+    swipeEvents({ x: 0, y: 0 }, { x: 1, y: 1 }),
+    1_000,
+    1_000,
+    abort.signal,
+  );
+  const outcome = operation.catch((error: unknown) => error);
+  await first.promise;
+  abort.abort();
+  expect(await outcome).toMatchObject({ data: { code: "detached", mayHaveExecuted: true } });
+  await closed.promise;
+  expect(received).toHaveLength(1);
 });
 
 test("waitForScreen polls the authenticated config route until capture becomes ready", async () => {

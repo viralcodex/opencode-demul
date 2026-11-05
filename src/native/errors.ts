@@ -31,3 +31,14 @@ export function deviceError(
 export function isDeviceFailure(value: unknown): value is DeviceFailure {
   return value instanceof DeviceFailure;
 }
+
+export function cancellationError(signal: AbortSignal, mayHaveExecuted = false): DeviceFailure {
+  const timedOut = signal.reason instanceof Error && signal.reason.name === "TimeoutError";
+  return deviceError(
+    timedOut ? "timeout" : "detached",
+    timedOut
+      ? "The device operation exceeded its deadline."
+      : "The device operation was cancelled.",
+    mayHaveExecuted,
+  );
+}

@@ -84,7 +84,7 @@ function fixture() {
         deviceId: handle.deviceId,
         baseUrl: "http://127.0.0.1:3400",
         token: "private",
-        protocol: "mjpeg",
+        protocol: "h264",
         loopback: true,
       };
     },

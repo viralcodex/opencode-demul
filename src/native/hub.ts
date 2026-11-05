@@ -1,5 +1,5 @@
 import { Device } from "../rpc.js";
-import { deviceError } from "./errors.js";
+import { cancellationError, deviceError, isDeviceFailure } from "./errors.js";
 import { spawnProcess, stopProcess, type LongRunningProcess } from "./process.js";
 import { Option, Schema } from "effect";
 import { parseJson } from "./json.js";
@@ -9,6 +9,23 @@ export async function sendGesture(
   gesture:
     | { type: "tap"; x: number; y: number }
     | { type: "swipe"; x1: number; y1: number; x2: number; y2: number; durationMs: number },
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const requestSignal = AbortSignal.any([AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]);
+  try {
+    await postGesture(stream, gesture, requestSignal);
+  } catch (error) {
+    if (isDeviceFailure(error)) throw error;
+    if (requestSignal.aborted) throw cancellationError(requestSignal, true);
+    throw deviceError("helper-failed", "The device gesture connection failed.", true);
+  }
+}
+
+async function postGesture(
+  stream: Device.StreamDescriptor,
+  gesture: Parameters<typeof sendGesture>[1],
+  signal: AbortSignal,
 ): Promise<void> {
   const url = new URL(`/vendor/serve-emu/api/${gesture.type}`, stream.baseUrl);
   url.searchParams.set("device", stream.deviceId);
@@ -17,7 +34,7 @@ export async function sendGesture(
     headers: { Authorization: `Bearer ${stream.token}`, "Content-Type": "application/json" },
     body: JSON.stringify(gesture),
     redirect: "error",
-    signal: AbortSignal.timeout(10_000),
+    signal,
   });
   const result = parseJson(
     Schema.Struct({ ok: Schema.Boolean, error: Schema.optionalKey(Schema.String) }),
@@ -46,6 +63,8 @@ export interface HubOptions {
   stopKillMs?: number;
   env?: Record<string, string>;
   signal?: AbortSignal;
+  // Preserve a stop that timed out before startup completed, so the owning runtime can retry it.
+  onCleanupFailure?: (stop: () => Promise<void>) => void;
 }
 
 // The hub's ready endpoint: a loopback origin and the session token minted by `--require-token`.
@@ -57,11 +76,6 @@ export interface HubReady {
 // The loopback host the hub binds to. The stream never leaves the machine.
 export const LOOPBACK_HOST = "127.0.0.1";
 
-// Android's serve-emu always streams H.264 and iOS's serve-sim streams MJPEG, whatever `--transport` says.
-function streamProtocolFor(platform: Device.Platform): Device.StreamProtocol {
-  return platform === "ios" ? "mjpeg" : "h264";
-}
-
 export function hubArgs(options: HubOptions): string[] {
   return [
     options.hubCli,
@@ -69,7 +83,7 @@ export function hubArgs(options: HubOptions): string[] {
     LOOPBACK_HOST,
     "--require-token",
     "--transport",
-    streamProtocolFor(options.platform),
+    "h264",
     "--platform",
     options.platform,
     "--single-device",
@@ -98,7 +112,7 @@ export function streamDescriptor(
     deviceId,
     baseUrl: ready.baseUrl,
     token: ready.token,
-    protocol: streamProtocolFor(platform),
+    protocol: "h264",
     loopback: true,
   };
 }
@@ -115,18 +129,14 @@ export function startHub(options: HubOptions, spawn = spawnProcess): Promise<Hub
   const readyTimeoutMs = options.readyTimeoutMs ?? 60_000;
   return new Promise<HubSession>((resolve, reject) => {
     let settled = false;
-    let ready: HubReady | null = null;
     const process = spawn({
       command: options.externalNode,
       args: hubArgs(options),
       env: options.env,
       onStdoutLine: (line) => {
-        if (ready) return;
+        if (settled) return;
         const parsed = parseReady(line);
-        if (parsed) {
-          ready = parsed;
-          finishReady(parsed);
-        }
+        if (parsed) finishReady(parsed);
       },
     });
     const timer = setTimeout(() => {
@@ -142,7 +152,13 @@ export function startHub(options: HubOptions, spawn = spawnProcess): Promise<Hub
     };
     const fail = (error: unknown) =>
       finish(() => {
-        void stop().then(() => reject(error), reject);
+        void stop().then(
+          () => reject(error),
+          (cleanupError) => {
+            options.onCleanupFailure?.(stop);
+            reject(cleanupError);
+          },
+        );
       });
     const abort = () => fail(options.signal?.reason);
     options.signal?.addEventListener("abort", abort, { once: true });

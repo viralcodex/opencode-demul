@@ -153,8 +153,8 @@ test.each([false, true])(
   },
 );
 
-test.each(["close", "reopen"])(
-  "failed cleanup quarantines the handle and retains shutdown intent through %s",
+test.each(["close", "reopen", "detach"])(
+  "failed cleanup quarantines the handle and follows shutdown policy during %s",
   async (recovery) => {
     const item = fixture();
     const first = await item.controller.open(caller, selection, "manual");
@@ -173,8 +173,12 @@ test.each(["close", "reopen"])(
       item.controller.open({ ...caller, sessionID: "other" }, selection, "manual"),
     ).rejects.toMatchObject({ code: "device-busy" });
     item.runtime.close = close;
-    if (recovery === "close") {
-      await item.controller.close(caller, { handle: first.handle }, "manual");
+    if (recovery !== "reopen") {
+      await item.controller.close(
+        caller,
+        { handle: first.handle, ...(recovery === "detach" ? { shutdown: false } : {}) },
+        "manual",
+      );
       expect(item.controller.state(caller)).toBeNull();
       expect(item.calls).toEqual(["open", "close"]);
     } else {
@@ -182,7 +186,7 @@ test.each(["close", "reopen"])(
       expect(next.handle.token).not.toBe(first.handle.token);
       expect(item.calls).toEqual(["open", "close", "open"]);
     }
-    expect(item.closes[0]?.shutdown).toBe(true);
+    expect(item.closes[0]?.shutdown).toBe(recovery === "detach" ? undefined : true);
     await item.controller.dispose();
   },
 );

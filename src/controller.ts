@@ -145,7 +145,7 @@ export function createDeviceController(
   const release = (
     entry: Attachment,
     reason: CleanupReason,
-    shutdown = false,
+    shutdown?: boolean,
     signal?: AbortSignal,
   ): Promise<void> => {
     if (entry.state.type === "released") return Promise.resolve();
@@ -153,8 +153,9 @@ export function createDeviceController(
     const previous = entry.state;
     if (previous.type === "cleanup-failed") {
       reason = previous.reason;
-      shutdown ||= previous.shutdown;
+      shutdown ??= previous.shutdown;
     }
+    shutdown ??= false;
     const pending = entry.queue.drain().then(async () => {
       if (signal?.aborted) {
         entry.state = previous;

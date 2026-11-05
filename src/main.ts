@@ -12,10 +12,19 @@ import { deviceError, isDeviceFailure } from "./native/errors.js";
 import { createNativeRuntime, type DeviceRuntime } from "./native/runtime.js";
 import type { Device } from "./rpc.js";
 import { startStreamProxy, type StreamProxy } from "./stream-proxy.js";
+import { waitWithSignal } from "./cancellation.js";
+import { retryUntilStopped } from "./retry.js";
+
+type ConnectionState =
+  | { type: "connecting" | "reporting"; gate: ReturnType<typeof Promise.withResolvers<void>> }
+  | { type: "ready" | "closed" };
+type Binding =
+  | { type: "attached"; owner: DeviceCaller }
+  | { type: "releasing"; owner: DeviceCaller; pending: Promise<void> };
 
 interface Connection {
   windows: Set<number>;
-  ready: Promise<void>;
+  state: ConnectionState;
   reporting: Promise<void>;
   sessionID: string;
   serverID: string;
@@ -24,23 +33,24 @@ interface Connection {
   abort: AbortController;
   requests: Map<string, AbortController>;
   stopEvents: () => void;
-  closed: boolean;
   proxy?: { token: string; sourceToken: string; pending: Promise<StreamProxy> };
 }
 
 export function createMainSetup(
   runtime: () => DeviceRuntime = createNativeRuntime,
+  retryDelayMs = 250,
 ): Plugin.MainSetup {
   return (ctx) => {
     let controller: DeviceController | undefined;
     const connections = new Map<string, Connection>();
-    const bindings = new Map<string, DeviceCaller>();
+    const bindings = new Map<string, Binding>();
     const lifecycle = new AbortController();
-    let watching = false;
+    let watching: Promise<void> | undefined;
     const connectionKey = (scope: DeviceCaller) =>
       JSON.stringify([scope.serverID, scope.sessionID]);
     const getController = () => (controller ??= createDeviceController(runtime()));
     const requireLocal = (serverID: string) => {
+      lifecycle.signal.throwIfAborted();
       if (!ctx.serverEndpoints.get(serverID)?.sameMachine) {
         throw deviceError(
           "unsupported",
@@ -55,7 +65,7 @@ export function createMainSetup(
     const current = (scope: DeviceBridge.Scope, window: number) => {
       requireLocal(scope.serverID);
       const connection = connections.get(connectionKey(scope));
-      if (!connection || connection.closed || !connection.windows.has(window))
+      if (!connection || connection.state.type !== "ready" || !connection.windows.has(window))
         throw new Error("device.bridge.disconnected");
       return connection;
     };
@@ -64,11 +74,15 @@ export function createMainSetup(
     const stopProxy = async (connection: Connection) => {
       const proxy = connection.proxy;
       connection.proxy = undefined;
-      await proxy?.pending.then((value) => value.stop()).catch(() => undefined);
+      await proxy?.pending
+        .then((value) => value.stop())
+        .catch((error) => {
+          ctx.log.write("warn", "device stream cleanup failed", { error: String(error) });
+        });
     };
     const report = (connection: Connection) => {
       const result = connection.reporting.then(async () => {
-        if (connection.closed) return;
+        if (connection.state.type === "closed") return;
         const state = getController().state(caller(connection));
         if (connection.proxy && connection.proxy.token !== state?.handle.token)
           await stopProxy(connection);
@@ -85,37 +99,71 @@ export function createMainSetup(
       connection.reporting = result.catch(() => undefined);
       return result;
     };
-    const disconnect = async (connection: Connection, releaseDevice = false) => {
+    const disconnect = async (
+      connection: Connection,
+      error: unknown = new Error("The device connection closed before it was ready."),
+    ) => {
       const key = connectionKey(connection);
-      if (connection.closed || connections.get(key) !== connection) return;
-      connection.closed = true;
+      if (connection.state.type === "closed" || connections.get(key) !== connection) return;
+      const previous = connection.state;
+      connection.state = { type: "closed" };
       connections.delete(key);
+      if ("gate" in previous) previous.gate.reject(error);
       connection.stopEvents();
       connection.abort.abort();
       connection.requests.forEach((request) => request.abort());
       await stopProxy(connection);
-      if (releaseDevice) await controller?.detach(caller(connection));
-      if (!controller?.state(caller(connection))) bindings.delete(key);
+      if (bindings.get(key)?.type === "attached" && !controller?.state(caller(connection)))
+        bindings.delete(key);
       changed(connection);
     };
+    const releaseBinding = (binding: Binding): Promise<void> => {
+      if (binding.type === "releasing") return binding.pending;
+      const key = connectionKey(binding.owner);
+      const releasing: Extract<Binding, { type: "releasing" }> = {
+        type: "releasing",
+        owner: binding.owner,
+        pending: Promise.resolve().then(() =>
+          retryUntilStopped(
+            async () => {
+              const connection = connections.get(key);
+              if (connection) await disconnect(connection);
+              await controller?.detach(binding.owner);
+              if (bindings.get(key) === releasing) bindings.delete(key);
+            },
+            lifecycle.signal,
+            (error) => {
+              ctx.log.write("warn", "device session cleanup failed; retrying", {
+                error: String(error),
+              });
+            },
+            retryDelayMs,
+          ),
+        ),
+      };
+      bindings.set(key, releasing);
+      return releasing.pending;
+    };
     const watchSessions = () => {
-      if (watching) return;
-      watching = true;
-      void (async () => {
-        for await (const event of ctx.client.event.subscribe({ signal: lifecycle.signal })) {
-          if (event.type !== "session.deleted" && event.type !== "session.moved") continue;
-          for (const [key, owner] of bindings) {
-            if (owner.sessionID !== event.data.sessionID) continue;
-            bindings.delete(key);
-            const connection = connections.get(key);
-            if (connection) await disconnect(connection, true);
-            else await controller?.detach(owner);
+      watching ??= retryUntilStopped(
+        async () => {
+          for await (const event of ctx.client.event.subscribe({ signal: lifecycle.signal })) {
+            if (lifecycle.signal.aborted) return;
+            if (event.type !== "session.deleted" && event.type !== "session.moved") continue;
+            for (const binding of bindings.values()) {
+              if (binding.owner.sessionID === event.data.sessionID) void releaseBinding(binding);
+            }
           }
-        }
-      })().catch((error) => {
-        if (!lifecycle.signal.aborted)
-          ctx.log.write("warn", "device session events failed", { error: String(error) });
-      });
+          if (!lifecycle.signal.aborted) throw new Error("The device session event stream closed.");
+        },
+        lifecycle.signal,
+        (error) => {
+          ctx.log.write("warn", "device session events failed; reconnecting", {
+            error: String(error),
+          });
+        },
+        retryDelayMs,
+      );
     };
     const unsubscribe = async (connection: Connection, window: number) => {
       connection.windows.delete(window);
@@ -125,31 +173,26 @@ export function createMainSetup(
       if (!controller?.state(caller(connection))) await disconnect(connection);
     };
     const command = async (connection: Connection, requestID: string) => {
-      if (connection.closed || connection.requests.has(requestID)) return;
+      if (connection.state.type === "closed" || connection.requests.has(requestID)) return;
       const request = new AbortController();
       connection.requests.set(requestID, request);
+      const signal = AbortSignal.any([connection.abort.signal, request.signal]);
       const rpc = ctx.client.rpc(DeviceBridge.ControlRpc);
       try {
         const outcome = await rpc
           .command(
             { sessionID: connection.sessionID, connectionID: connection.connectionID, requestID },
             {
-              signal: AbortSignal.any([connection.abort.signal, request.signal]),
+              signal,
               location: connection.location,
             },
           )
           .then(
             (operation) =>
-              runOperation(
-                getController(),
-                caller(connection),
-                operation,
-                "agent",
-                AbortSignal.any([connection.abort.signal, request.signal]),
-              ),
+              runOperation(getController(), caller(connection), operation, "agent", signal),
             (error): DeviceBridge.Outcome => ({ type: "failure", error: failure(error) }),
           );
-        if (connection.closed || request.signal.aborted) return;
+        if (signal.aborted) return;
         await rpc.result(
           {
             sessionID: connection.sessionID,
@@ -161,23 +204,38 @@ export function createMainSetup(
         );
         await report(connection);
       } catch (error) {
-        if (!connection.closed && !request.signal.aborted) {
+        if (!signal.aborted) {
           ctx.log.write("warn", "device command failed", { requestID, error: String(error) });
         }
       } finally {
         connection.requests.delete(requestID);
       }
     };
+    const readyConnection = async (connection: Connection) => {
+      const previous = connection.state;
+      if (previous.type !== "connecting") return;
+      const reporting: ConnectionState = { type: "reporting", gate: previous.gate };
+      connection.state = reporting;
+      try {
+        await report(connection);
+        if (connection.state !== reporting) return;
+        connection.state = { type: "ready" };
+        previous.gate.resolve();
+      } catch (error) {
+        await disconnect(connection, error);
+      }
+    };
     const createConnection = (scope: DeviceBridge.Scope) => {
       const { sessionID, serverID, location } = scope;
+      if (bindings.get(connectionKey(scope))?.type === "releasing")
+        throw deviceError("detached", "This session is releasing its device attachment.");
       getController();
       watchSessions();
       const connectionID = crypto.randomUUID();
       const abort = new AbortController();
-      const ready = Promise.withResolvers<void>();
       const connection: Connection = {
         windows: new Set(),
-        ready: ready.promise,
+        state: { type: "connecting", gate: Promise.withResolvers<void>() },
         reporting: Promise.resolve(),
         sessionID,
         serverID,
@@ -186,17 +244,21 @@ export function createMainSetup(
         abort,
         requests: new Map(),
         stopEvents: () => undefined,
-        closed: false,
       };
-      connection.ready = ready.promise.then(() => report(connection));
       connections.set(connectionKey(connection), connection);
-      bindings.set(connectionKey(connection), caller(connection));
+      bindings.set(connectionKey(connection), { type: "attached", owner: caller(connection) });
       const rpc = ctx.client.rpc(DeviceBridge.ControlRpc);
       connection.stopEvents = rpc.events.on(
         "control",
         (event) => {
-          if (event.data.connectionID !== connectionID || connection.closed) return;
-          if (event.data.type === "attached") return ready.resolve();
+          if (event.data.connectionID !== connectionID || connection.state.type === "closed")
+            return;
+          if (event.data.type === "attached") {
+            void readyConnection(connection).catch((error) => {
+              ctx.log.write("warn", "device connection cleanup failed", { error: String(error) });
+            });
+            return;
+          }
           if (event.data.type === "cancel") {
             connection.requests.get(event.data.requestID)?.abort();
             return;
@@ -215,16 +277,14 @@ export function createMainSetup(
         }
         throw new Error("The device event stream closed before it connected.");
       })();
-      void attached.then(
-        () => {
-          ready.reject(new Error("The device connection closed before it was ready."));
-          return disconnect(connection);
-        },
-        (error) => {
-          ready.reject(error);
-          return disconnect(connection);
-        },
-      );
+      void attached
+        .then(
+          () => disconnect(connection),
+          (error) => disconnect(connection, error),
+        )
+        .catch((error) =>
+          ctx.log.write("warn", "device connection cleanup failed", { error: String(error) }),
+        );
       return connection;
     };
     const connect = async (scope: DeviceBridge.Scope, window: number, signal: AbortSignal) => {
@@ -232,19 +292,18 @@ export function createMainSetup(
       requireLocal(scope.serverID);
       const connection = connections.get(connectionKey(scope)) ?? createConnection(scope);
       connection.windows.add(window);
-      const aborted = Promise.withResolvers<never>();
-      const cancelled = () => {
-        aborted.reject(signal.reason);
-        void unsubscribe(connection, window);
-      };
-      signal.addEventListener("abort", cancelled, { once: true });
       try {
-        if (signal.aborted) cancelled();
-        await Promise.race([connection.ready, aborted.promise]);
+        const state = connection.state;
+        if ("gate" in state) await waitWithSignal(state.gate.promise, signal);
         signal.throwIfAborted();
+        if (connection.state.type !== "ready") throw new Error("device.bridge.disconnected");
         provider.changed(window);
-      } finally {
-        signal.removeEventListener("abort", cancelled);
+      } catch (error) {
+        if (signal.aborted)
+          void unsubscribe(connection, window).catch((error) =>
+            ctx.log.write("warn", "device connection cleanup failed", { error: String(error) }),
+          );
+        throw error;
       }
     };
     const requireStream = (
@@ -287,7 +346,11 @@ export function createMainSetup(
             : undefined;
           return {
             type: "devices",
-            devices: await getController().list(input.platform, owner, ipcCaller.signal),
+            devices: await getController().list(
+              input.platform,
+              owner,
+              AbortSignal.any([lifecycle.signal, ipcCaller.signal]),
+            ),
           };
         }),
       access: async (input, ipcCaller) => {
@@ -353,12 +416,20 @@ export function createMainSetup(
           [...connections.values()]
             .filter((connection) => connection.windows.has(window.id))
             .map((connection) => unsubscribe(connection, window.id)),
+        ).catch((error) =>
+          ctx.log.write("warn", "device window cleanup failed", { error: String(error) }),
         );
       }),
     );
     ctx.onCleanup(async () => {
       lifecycle.abort();
       await Promise.all([...connections.values()].map((connection) => disconnect(connection)));
+      await watching;
+      await Promise.all(
+        [...bindings.values()].flatMap((binding) =>
+          binding.type === "releasing" ? [binding.pending] : [],
+        ),
+      );
       bindings.clear();
       await controller?.dispose();
     });

@@ -9,8 +9,10 @@ import { AbsolutePath } from "@opencode/schema/schema";
 import { Session } from "@opencode/schema/session";
 import { Tool } from "@opencode/schema/tool";
 import { DateTime, Effect, Exit, Fiber, Schema, Scope, Stream } from "effect";
+import { TestClock } from "effect/testing";
 import { DeviceBridge } from "./bridge.js";
 import { DeviceServer } from "./server.js";
+import { DEVICE_OPERATION_TIMEOUT_MS, DEVICE_REQUEST_TIMEOUT_MS } from "./deadlines.js";
 
 const DIRECTORY = "/project";
 const CONNECTION = "connection-a";
@@ -72,11 +74,6 @@ const devicesOutcome = Schema.decodeUnknownSync(DeviceBridge.Outcome)({
   type: "success",
   value: devicesValue,
 });
-const failureOutcome = Schema.decodeUnknownSync(DeviceBridge.Outcome)({
-  type: "failure",
-  error: { code: "device-busy", message: "The device is busy.", mayHaveExecuted: false },
-});
-
 // The server only reads `session.get`; every other method dies if a future change starts using it.
 const notUsed = (..._args: ReadonlyArray<unknown>): Effect.Effect<never> =>
   Effect.die("The device server does not use this session domain method.");
@@ -220,27 +217,14 @@ test("attach registers the connection and announces protocol version 1", async (
   );
 });
 
-test("attach rejects a session that does not exist", async () => {
-  const context = harness([]);
-  await run(
-    Effect.gen(function* () {
-      yield* DeviceServer.make(context.ctx);
-      const exit = yield* context
-        .handlers()
-        .attach({ sessionID: "ses_missing", connectionID: CONNECTION, version: 1 }, context.call)
-        .pipe(Effect.exit);
-      expect(Exit.isFailure(exit)).toBe(true);
-      expect(context.rejections).toContainEqual({
-        type: "unavailable",
-        message: "Session not found.",
-        data: { code: "not-found", message: "Session not found.", mayHaveExecuted: false },
-      });
-    }),
-  );
-});
-
-test("attach rejects a session bound to another location", async () => {
-  const context = harness([makeSession(SESSION_ID, "/elsewhere")]);
+test.each([
+  { sessions: [], message: "Session not found." },
+  {
+    sessions: [makeSession(SESSION_ID, "/elsewhere")],
+    message: "Session belongs to another location.",
+  },
+])("attach rejects an unavailable session: $message", async ({ sessions, message }) => {
+  const context = harness(sessions);
   await run(
     Effect.gen(function* () {
       yield* DeviceServer.make(context.ctx);
@@ -249,7 +233,11 @@ test("attach rejects a session bound to another location", async () => {
         .attach({ sessionID: SESSION_ID, connectionID: CONNECTION, version: 1 }, context.call)
         .pipe(Effect.exit);
       expect(Exit.isFailure(exit)).toBe(true);
-      expect(context.rejections.at(-1)?.message).toBe("Session belongs to another location.");
+      expect(context.rejections).toContainEqual({
+        type: "unavailable",
+        message,
+        data: { code: "not-found", message, mayHaveExecuted: false },
+      });
     }),
   );
 });
@@ -274,16 +262,23 @@ test("state updates require the matching connection", async () => {
   );
 });
 
-test("request reports a disconnected error when no connection is attached", async () => {
+test.each([
+  { code: "disconnected", state: null, operation: snapshotOperation },
+  { code: "denied", state: attachmentWithoutAccess, operation: snapshotOperation },
+  { code: "detached", state: attachmentWithAccess, operation: staleOperation },
+])("a $code request fails before dispatch", async ({ code, state, operation }) => {
   const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
   await run(
     Effect.gen(function* () {
       const server = yield* DeviceServer.make(context.ctx);
-      const error = yield* server
-        .request(Session.ID.make(SESSION_ID), snapshotOperation)
-        .pipe(Effect.flip);
+      if (state) {
+        yield* context.attach();
+        yield* context.push(state);
+      }
+      const error = yield* server.request(Session.ID.make(SESSION_ID), operation).pipe(Effect.flip);
       expect(error).toBeInstanceOf(Tool.Error);
-      expect(error.message).toContain("[device.disconnected]");
+      expect(error.message).toContain(`[device.${code}]`);
+      expect(context.emitted.some((control) => control.type === "command")).toBe(false);
     }),
   );
 });
@@ -331,23 +326,6 @@ test("list forwards to the desktop without requiring device access", async () =>
   );
 });
 
-test("a device-bound operation is denied until the session is granted device access", async () => {
-  const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
-  await run(
-    Effect.gen(function* () {
-      const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context.attach();
-      yield* context.push(attachmentWithoutAccess);
-      const error = yield* server
-        .request(Session.ID.make(SESSION_ID), snapshotOperation)
-        .pipe(Effect.flip);
-      expect(error.message).toContain("[device.denied]");
-      expect(context.emitted.some((control) => control.type === "command")).toBe(false);
-      yield* Fiber.interrupt(attach);
-    }),
-  );
-});
-
 test("open adopts the attached device and rejects a different one", async () => {
   const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
   await run(
@@ -361,23 +339,6 @@ test("open adopts the attached device and rejects a different one", async () => 
         .request(Session.ID.make(SESSION_ID), openOtherDevice)
         .pipe(Effect.flip);
       expect(error.message).toContain("[device.unavailable]");
-      expect(context.emitted.some((control) => control.type === "command")).toBe(false);
-      yield* Fiber.interrupt(attach);
-    }),
-  );
-});
-
-test("a stale device handle is rejected before dispatch", async () => {
-  const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
-  await run(
-    Effect.gen(function* () {
-      const server = yield* DeviceServer.make(context.ctx);
-      const attach = yield* context.attach();
-      yield* context.push(attachmentWithAccess);
-      const error = yield* server
-        .request(Session.ID.make(SESSION_ID), staleOperation)
-        .pipe(Effect.flip);
-      expect(error.message).toContain("[device.detached]");
       expect(context.emitted.some((control) => control.type === "command")).toBe(false);
       yield* Fiber.interrupt(attach);
     }),
@@ -413,7 +374,43 @@ test("a forwarded operation resolves with the desktop's successful outcome", asy
   );
 });
 
-test("a failed outcome surfaces the device error as a tool error", async () => {
+test.each([false, true])(
+  "a failed outcome preserves dispatch uncertainty in the tool error, executed=%s",
+  async (mayHaveExecuted) => {
+    const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
+    await run(
+      Effect.gen(function* () {
+        const server = yield* DeviceServer.make(context.ctx);
+        const attach = yield* context.attach();
+        yield* context.push(attachmentWithAccess);
+        const request = yield* server
+          .request(Session.ID.make(SESSION_ID), snapshotOperation)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.yieldNow;
+        const requestID = commandRequestID(context.emitted);
+        yield* context.handlers().result(
+          {
+            sessionID: SESSION_ID,
+            connectionID: CONNECTION,
+            requestID,
+            outcome: {
+              type: "failure",
+              error: { code: "device-busy", message: "The device is busy.", mayHaveExecuted },
+            },
+          },
+          context.call,
+        );
+        const error = yield* Fiber.join(request).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(Tool.Error);
+        expect(error.message).toContain("[device.device-busy] The device is busy.");
+        expect(error.message.includes("may already have run")).toBe(mayHaveExecuted);
+        yield* Fiber.interrupt(attach);
+      }),
+    );
+  },
+);
+
+test("the RPC deadline exceeds the native deadline and cancels a timed-out desktop request", async () => {
   const context = harness([makeSession(SESSION_ID, DIRECTORY)]);
   await run(
     Effect.gen(function* () {
@@ -423,19 +420,20 @@ test("a failed outcome surfaces the device error as a tool error", async () => {
       const request = yield* server
         .request(Session.ID.make(SESSION_ID), snapshotOperation)
         .pipe(Effect.forkChild({ startImmediately: true }));
-      yield* Effect.yieldNow;
+      expect(DEVICE_REQUEST_TIMEOUT_MS).toBeGreaterThan(DEVICE_OPERATION_TIMEOUT_MS);
+      yield* TestClock.adjust(DEVICE_REQUEST_TIMEOUT_MS - 1);
+      expect(request.pollUnsafe()).toBeUndefined();
       const requestID = commandRequestID(context.emitted);
-      yield* context
-        .handlers()
-        .result(
-          { sessionID: SESSION_ID, connectionID: CONNECTION, requestID, outcome: failureOutcome },
-          context.call,
-        );
+      yield* TestClock.adjust(1);
       const error = yield* Fiber.join(request).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(Tool.Error);
-      expect(error.message).toContain("[device.device-busy] The device is busy.");
+      expect(error.message).toContain("outcome is unknown");
+      expect(context.emitted).toContainEqual({
+        type: "cancel",
+        connectionID: CONNECTION,
+        requestID,
+      });
       yield* Fiber.interrupt(attach);
-    }),
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 });
 

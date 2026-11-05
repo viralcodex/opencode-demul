@@ -3,6 +3,7 @@ import { Device } from "../rpc.js";
 import { deviceError, type DeviceFailure } from "./errors.js";
 import { parseJson } from "./json.js";
 import { runCommand, type CommandResult } from "./process.js";
+import { DEVICE_OPERATION_TIMEOUT_MS } from "../deadlines.js";
 
 export interface AutomationOptions {
   externalNode: string;
@@ -202,9 +203,9 @@ export function parseFailure(
 ): DeviceFailure | null {
   const parsed = parseJson(FailureReport, output.trim());
   if (Option.isNone(parsed)) return null;
-  const { code, message, hint, details } = parsed.value.error;
-  const executed = details?.dispatched === "no" ? false : mayHaveExecuted;
-  if (details?.reason === "ios_app_session_required")
+  const { code, message, hint, details = {} } = parsed.value.error;
+  const executed = details.dispatched === "no" ? false : mayHaveExecuted;
+  if (details.reason === "ios_app_session_required")
     return deviceError(
       "missing-prerequisite",
       `${action} needs an app session on iOS; launch the app under test first.`,
@@ -225,7 +226,7 @@ export interface Automation {
 
 // Build the dispatcher bound to one external Node, agent-device CLI, platform, and isolated session directory.
 export function createAutomation(options: AutomationOptions): Automation {
-  const timeout = options.timeoutMs ?? 120_000;
+  const timeout = options.timeoutMs ?? DEVICE_OPERATION_TIMEOUT_MS;
   // Every command is pinned to the one selected device, and the isolated cwd scopes the implicit per-attachment session.
   const selection = [
     "--platform",

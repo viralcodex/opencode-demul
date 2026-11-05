@@ -99,14 +99,7 @@ export async function ensureSimulatorBooted(
   if (device.state === "booted") return { deviceId: udid, bootedByUs: false };
 
   const bootTimeoutMs = options.timeoutMs ?? 180_000;
-  let bootedByUs = false;
-  if (device.state === "shutdown") {
-    // Finish the boot command so cancellation knows whether this call owns the simulator.
-    const boot = await simctl(run, ["boot", udid], bootTimeoutMs);
-    if (boot.code !== 0 && !ALREADY_BOOTED.test(boot.stderr))
-      throw simctlFailure("Booting the simulator", boot);
-    bootedByUs = boot.code === 0;
-  }
+  const bootedByUs = await bootSimulator(device, udid, bootTimeoutMs, run);
   try {
     options.signal?.throwIfAborted();
     requireSuccess(
@@ -120,6 +113,20 @@ export async function ensureSimulatorBooted(
     throw error;
   }
   return { deviceId: udid, bootedByUs };
+}
+
+async function bootSimulator(
+  device: Device.DeviceInfo,
+  udid: string,
+  timeoutMs: number,
+  run: typeof runCommand,
+): Promise<boolean> {
+  if (device.state !== "shutdown") return false;
+  // Finish the boot command so cancellation knows whether this call owns the simulator.
+  const boot = await simctl(run, ["boot", udid], timeoutMs);
+  if (boot.code !== 0 && !ALREADY_BOOTED.test(boot.stderr))
+    throw simctlFailure("Booting the simulator", boot);
+  return boot.code === 0;
 }
 
 function simulatorForBoot(

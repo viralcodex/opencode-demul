@@ -49,9 +49,15 @@ without detaching the device, so agents can keep working. Use `device.close` to
 release it; deleting or moving the session also releases it. A failed device switch keeps the
 previous attachment.
 
+Refresh retries failed video capture without changing the attached device. If a helper exits,
+the plugin restarts capture on the next stream request.
+
 Agent access starts enabled. Use the switch to revoke access for the current
 session. Agents can only use a device you have opened.
 Installing an app or shutting down a device requires a separate permission prompt.
+
+Cancelling a dispatched action cannot undo device input already sent. Read device state before
+retrying an action whose outcome is unknown.
 
 Tools use `device_*` names, or `device.*` in Code Mode. They can inspect the
 screen, launch apps, enter text, interact with elements and take screenshots.

@@ -1,7 +1,9 @@
 import { Device } from "./rpc.js";
 import type { DeviceBridge } from "./bridge.js";
-import { deviceError } from "./native/errors.js";
+import { cancellationError, deviceError, isDeviceFailure } from "./native/errors.js";
 import type { CloseInput, DeviceRuntime, OpenInput, OpenResult } from "./native/runtime.js";
+import { DEVICE_OPERATION_TIMEOUT_MS } from "./deadlines.js";
+import { OperationQueue } from "./operation-queue.js";
 
 export interface DeviceCaller {
   serverID: string;
@@ -15,48 +17,69 @@ type BoundOperation = Exclude<
 >;
 type Inspection = Extract<BoundOperation, { type: "apps" | "snapshot" | "screenshot" }>;
 type Mutation = Exclude<BoundOperation, Inspection>;
+const isInspection = (operation: BoundOperation): operation is Inspection =>
+  ["apps", "snapshot", "screenshot"].includes(operation.type);
 
 interface Attachment {
+  session: string;
   selection: OpenInput;
   device: OpenResult;
-  pending: Promise<void>;
+  queue: OperationQueue;
   agentAccess: boolean;
-  closing: boolean;
+  state: AttachmentState;
 }
 
-export function createDeviceController(runtime: DeviceRuntime) {
+type CleanupReason = "close" | "retire" | "rollback";
+type AttachmentState =
+  | { type: "preparing" | "attached" | "released" }
+  | { type: "cleanup"; reason: CleanupReason; shutdown: boolean; pending: Promise<void> }
+  | { type: "cleanup-failed"; reason: CleanupReason; shutdown: boolean };
+type Reservation = { session: string; state: { type: "reserved" } };
+
+export function createDeviceController(
+  runtime: DeviceRuntime,
+  operationTimeoutMs = DEVICE_OPERATION_TIMEOUT_MS,
+) {
   const sessions = new Map<string, Attachment>();
-  const devices = new Map<string, Attachment>();
-  const reservations = new Set<string>();
-  const rollbacks = new Map<string, OpenResult>();
+  const devices = new Map<string, Attachment | Reservation>();
   const transitions = new Map<string, Promise<void>>();
   const opening = new Map<string, AbortController>();
   const preparing = new Map<Promise<void>, { session: string; device: string }>();
-  const retiring = new Map<Attachment, { session: string; pending: Promise<void> }>();
-  let disposed = false;
+  const lifetime = new AbortController();
 
   const sessionKey = (caller: DeviceCaller) => JSON.stringify([caller.serverID, caller.sessionID]);
   const deviceKey = (platform: Device.Platform, deviceId: string) =>
     JSON.stringify([platform, deviceId]);
+  const attachmentFor = (key: string) => {
+    const slot = devices.get(key);
+    return slot && "device" in slot ? slot : undefined;
+  };
+  const occupied = (key: string, reservation: Reservation) =>
+    devices.has(key) && devices.get(key) !== reservation;
   const report = (entry: Attachment) => ({
     handle: entry.device.handle,
     selection: { platform: entry.selection.platform, deviceId: entry.selection.deviceId },
     capabilities: entry.device.capabilities,
     agentAccess: entry.agentAccess,
   });
-  const requireSession = (caller: DeviceCaller) => {
-    if (disposed) throw deviceError("detached", "The device controller has stopped.");
+  const requireSession = (caller: DeviceCaller, cleanup = false) => {
+    if (lifetime.signal.aborted)
+      throw deviceError("detached", "The device controller has stopped.");
     const entry = sessions.get(sessionKey(caller));
     if (!entry) throw deviceError("detached", "Attach a device in the Device panel first.");
-    if (entry.closing) throw deviceError("device-busy", "This session is changing its device.");
+    if (entry.state.type === "cleanup-failed" && !cleanup)
+      throw deviceError("detached", "Device cleanup is incomplete; retry closing this attachment.");
+    if (entry.state.type === "cleanup")
+      throw deviceError("device-busy", "This session is changing its device.");
     return entry;
   };
   const requireHandle = (
     caller: DeviceCaller,
     handle: Device.DeviceHandle,
     origin: DeviceOrigin,
+    cleanup = false,
   ) => {
-    const entry = requireSession(caller);
+    const entry = requireSession(caller, cleanup);
     const expected = entry.device.handle;
     if (!Device.sameHandle(expected, handle))
       throw deviceError(
@@ -115,154 +138,175 @@ export function createDeviceController(runtime: DeviceRuntime) {
     devices.forEach((value, key) => {
       if (value === entry) devices.delete(key);
     });
+    sessions.forEach((value, key) => {
+      if (value === entry) sessions.delete(key);
+    });
   };
-  const release = async (entry: Attachment, shutdown?: boolean, signal?: AbortSignal) => {
-    entry.closing = true;
-    try {
-      await entry.pending;
-      signal?.throwIfAborted();
-      await runtime.close({ handle: entry.device.handle, ...(shutdown ? { shutdown } : {}) });
-      forget(entry);
-    } catch (error) {
-      entry.closing = false;
-      throw error;
+  const release = (
+    entry: Attachment,
+    reason: CleanupReason,
+    shutdown = false,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    if (entry.state.type === "released") return Promise.resolve();
+    if (entry.state.type === "cleanup") return entry.state.pending;
+    const previous = entry.state;
+    if (previous.type === "cleanup-failed") {
+      reason = previous.reason;
+      shutdown ||= previous.shutdown;
     }
+    const pending = entry.queue.drain().then(async () => {
+      if (signal?.aborted) {
+        entry.state = previous;
+        signal.throwIfAborted();
+      }
+      try {
+        await runtime.close({ handle: entry.device.handle, ...(shutdown ? { shutdown } : {}) });
+        entry.state = { type: "released" };
+        forget(entry);
+      } catch (error) {
+        entry.state = { type: "cleanup-failed", reason, shutdown };
+        throw error;
+      }
+    });
+    entry.state = { type: "cleanup", reason, shutdown, pending };
+    return pending;
   };
-  const retire = (caller: DeviceCaller, entry: Attachment) => {
-    const pending = release(entry).then(
-      () => {
-        retiring.delete(entry);
-      },
-      // Keep ownership until reopening or disposal retries failed cleanup.
-      () => undefined,
-    );
-    retiring.set(entry, { session: sessionKey(caller), pending });
+  const finishCleanup = async (entry: Attachment) => {
+    if (entry.state.type === "cleanup") await entry.state.pending.catch(() => undefined);
+    if (entry.state.type === "cleanup-failed")
+      await release(entry, entry.state.reason, entry.state.shutdown);
   };
-  const finishRetirement = async (caller: DeviceCaller, input: OpenInput) => {
-    const entry = devices.get(deviceKey(input.platform, input.deviceId));
-    const cleanup = entry && retiring.get(entry);
-    if (!entry || !cleanup || cleanup.session !== sessionKey(caller)) return;
-    await cleanup.pending;
-    if (!retiring.has(entry)) return;
-    await release(entry);
-    retiring.delete(entry);
+  const finishPrevious = async (caller: DeviceCaller, input: OpenInput) => {
+    const entry = attachmentFor(deviceKey(input.platform, input.deviceId));
+    if (entry?.session === sessionKey(caller)) await finishCleanup(entry);
   };
-  const rollback = async (key: string, device: OpenResult) => {
-    rollbacks.set(key, device);
-    await runtime.close({ handle: device.handle, shutdown: true });
-    rollbacks.delete(key);
-  };
-  const discard = async (entry: Attachment) => {
-    try {
-      await rollback(deviceKey(entry.selection.platform, entry.selection.deviceId), entry.device);
-    } finally {
-      forget(entry);
-    }
-  };
-  const acquire = async (input: OpenInput, signal?: AbortSignal): Promise<Attachment> => {
+  const acquire = async (
+    caller: DeviceCaller,
+    input: OpenInput,
+    signal?: AbortSignal,
+  ): Promise<Attachment> => {
     const key = deviceKey(input.platform, input.deviceId);
-    if (devices.has(key) || reservations.has(key))
+    if (devices.has(key))
       throw deviceError("device-busy", "This device is controlled by another session.");
-    reservations.add(key);
+    const reservation: Reservation = { session: sessionKey(caller), state: { type: "reserved" } };
+    devices.set(key, reservation);
     try {
-      const device = rollbacks.get(key) ?? (await runtime.open(input, signal));
+      signal?.throwIfAborted();
+      const device = await runtime.open(input, signal);
+      const entry: Attachment = {
+        session: sessionKey(caller),
+        selection: input,
+        device,
+        queue: new OperationQueue(),
+        agentAccess: true,
+        state: { type: "preparing" },
+      };
       const physicalKey = deviceKey(device.handle.platform, device.handle.deviceId);
-      if (devices.has(physicalKey)) {
-        await runtime.close({ handle: device.handle });
+      const busy = occupied(physicalKey, reservation);
+      devices.set(key, entry);
+      if (busy) {
+        await release(entry, "rollback");
         throw deviceError("device-busy", "This device is controlled by another session.");
       }
-      if (signal?.aborted || disposed) {
-        await rollback(key, device);
+      devices.set(physicalKey, entry);
+      if (signal?.aborted || lifetime.signal.aborted) {
+        await release(entry, "rollback", true);
         signal?.throwIfAborted();
         throw deviceError("detached", "The device controller has stopped.");
       }
-      const entry: Attachment = {
-        selection: input,
-        device,
-        pending: Promise.resolve(),
-        agentAccess: true,
-        closing: false,
-      };
-      rollbacks.delete(key);
-      devices.set(key, entry);
-      devices.set(physicalKey, entry);
       return entry;
     } finally {
-      reservations.delete(key);
+      if (devices.get(key) === reservation) devices.delete(key);
     }
   };
   const execute = <Result>(
     caller: DeviceCaller,
     handle: Device.DeviceHandle,
     origin: DeviceOrigin,
-    action: (entry: Attachment) => Promise<Result>,
+    action: (entry: Attachment, signal: AbortSignal) => Promise<Result>,
     signal?: AbortSignal,
+    mutation = false,
   ) => {
     signal?.throwIfAborted();
     const entry = requireHandle(caller, handle, origin);
-    const result = entry.pending.then(() => {
-      signal?.throwIfAborted();
+    const combined = AbortSignal.any([
+      lifetime.signal,
+      AbortSignal.timeout(operationTimeoutMs),
+      ...(signal ? [signal] : []),
+    ]);
+    return entry.queue.run(async () => {
       requireHandle(caller, handle, origin);
-      return action(entry);
-    });
-    entry.pending = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+      try {
+        const result = await action(entry, combined);
+        if (combined.aborted) throw cancellationError(combined, mutation);
+        return result;
+      } catch (error) {
+        if (isDeviceFailure(error)) throw error;
+        if (combined.aborted) throw cancellationError(combined, mutation);
+        throw error;
+      }
+    }, combined);
   };
-  const inspect = async (operation: Inspection): Promise<DeviceBridge.Value> => {
+  const inspect = async (
+    operation: Inspection,
+    signal: AbortSignal,
+  ): Promise<DeviceBridge.Value> => {
     switch (operation.type) {
       case "apps":
-        return { type: "apps", apps: await runtime.apps(operation.handle) };
+        return { type: "apps", apps: await runtime.apps(operation.handle, signal) };
       case "snapshot":
-        return { type: "snapshot", snapshot: await runtime.snapshot(operation) };
+        return { type: "snapshot", snapshot: await runtime.snapshot(operation, signal) };
       case "screenshot":
-        return { type: "screenshot", screenshot: await runtime.screenshot(operation.handle) };
+        return {
+          type: "screenshot",
+          screenshot: await runtime.screenshot(operation.handle, signal),
+        };
     }
   };
-  const mutate = async (operation: Mutation): Promise<DeviceBridge.Value> => {
+  const mutate = async (operation: Mutation, signal: AbortSignal): Promise<DeviceBridge.Value> => {
     switch (operation.type) {
       case "launch":
-        return { type: "launch", result: await runtime.launch(operation) };
+        return { type: "launch", result: await runtime.launch(operation, signal) };
       case "install":
-        return { type: "install", result: await runtime.install(operation) };
+        return { type: "install", result: await runtime.install(operation, signal) };
       case "press":
-        await runtime.press(operation);
+        await runtime.press(operation, signal);
         break;
       case "tap":
-        await runtime.tap(operation);
+        await runtime.tap(operation, signal);
         break;
       case "fill":
-        await runtime.fill(operation);
+        await runtime.fill(operation, signal);
         break;
       case "swipe":
-        await runtime.swipe(operation);
+        await runtime.swipe(operation, signal);
         break;
       case "key":
-        await runtime.key(operation);
+        await runtime.key(operation, signal);
     }
     return { type: "done" };
   };
 
   return {
     async list(platform?: Device.Platform, caller?: DeviceCaller, signal?: AbortSignal) {
-      if (disposed) throw deviceError("detached", "The device controller has stopped.");
+      if (lifetime.signal.aborted)
+        throw deviceError("detached", "The device controller has stopped.");
       const own = caller ? sessions.get(sessionKey(caller)) : undefined;
       const listed = await runtime.list(platform, signal);
       signal?.throwIfAborted();
       return listed.map((device) => {
         const key = deviceKey(device.platform, device.id);
-        const owner = devices.get(key);
+        const owner = attachmentFor(key);
         if (owner)
           return {
             ...device,
             ownership:
-              owner === own || (caller && retiring.get(owner)?.session === sessionKey(caller))
+              owner === own || (caller && owner.session === sessionKey(caller))
                 ? ("owned-by-this-host" as const)
                 : ("owned-by-other" as const),
           };
-        return reservations.has(key) ? { ...device, ownership: "owned-by-other" as const } : device;
+        return devices.has(key) ? { ...device, ownership: "owned-by-other" as const } : device;
       });
     },
     state(caller: DeviceCaller) {
@@ -276,9 +320,13 @@ export function createDeviceController(runtime: DeviceRuntime) {
     },
     async open(caller: DeviceCaller, input: OpenInput, origin: DeviceOrigin, signal?: AbortSignal) {
       signal?.throwIfAborted();
-      if (disposed) throw deviceError("detached", "The device controller has stopped.");
+      if (lifetime.signal.aborted)
+        throw deviceError("detached", "The device controller has stopped.");
       const current = sessions.get(sessionKey(caller));
-      if (current && devices.get(deviceKey(input.platform, input.deviceId)) === current) {
+      if (
+        current?.state.type === "attached" &&
+        devices.get(deviceKey(input.platform, input.deviceId)) === current
+      ) {
         requireHandle(caller, current.device.handle, origin);
         if (origin === "manual") opening.get(sessionKey(caller))?.abort();
         return report(current);
@@ -289,26 +337,33 @@ export function createDeviceController(runtime: DeviceRuntime) {
           "Attach a device and enable agent access in the Device panel first.",
         );
       return prepare(caller, input, signal, async (signal) => {
-        await finishRetirement(caller, input);
+        await finishPrevious(caller, input);
         signal.throwIfAborted();
-        const entry = await acquire(input, signal);
+        const entry = await acquire(caller, input, signal);
         try {
           return await transition(caller, async () => {
             signal.throwIfAborted();
             const current = sessions.get(sessionKey(caller));
             entry.agentAccess = current?.agentAccess ?? true;
+            entry.state = { type: "attached" };
             sessions.set(sessionKey(caller), entry);
-            if (current) retire(caller, current);
+            if (current) void release(current, "retire").catch(() => undefined);
             return report(entry);
           });
         } catch (error) {
-          await discard(entry);
+          await release(entry, "rollback", true);
           throw error;
         }
       });
     },
-    async stream(caller: DeviceCaller, handle: Device.DeviceHandle) {
-      return execute(caller, handle, "manual", (entry) => runtime.stream(entry.device.handle));
+    async stream(caller: DeviceCaller, handle: Device.DeviceHandle, signal?: AbortSignal) {
+      return execute(
+        caller,
+        handle,
+        "manual",
+        (entry, signal) => runtime.stream(entry.device.handle, signal),
+        signal,
+      );
     },
     async run(
       caller: DeviceCaller,
@@ -316,21 +371,14 @@ export function createDeviceController(runtime: DeviceRuntime) {
       origin: DeviceOrigin,
       signal?: AbortSignal,
     ): Promise<DeviceBridge.Value> {
+      const inspection = isInspection(operation);
       return execute(
         caller,
         operation.handle,
         origin,
-        () => {
-          switch (operation.type) {
-            case "apps":
-            case "snapshot":
-            case "screenshot":
-              return inspect(operation);
-            default:
-              return mutate(operation);
-          }
-        },
+        (_, signal) => (inspection ? inspect(operation, signal) : mutate(operation, signal)),
         signal,
+        !inspection,
       );
     },
     async close(
@@ -340,13 +388,12 @@ export function createDeviceController(runtime: DeviceRuntime) {
       signal?: AbortSignal,
     ) {
       signal?.throwIfAborted();
-      requireHandle(caller, input.handle, origin);
+      requireHandle(caller, input.handle, origin, true);
       opening.get(sessionKey(caller))?.abort();
       return transition(caller, async () => {
         signal?.throwIfAborted();
-        const entry = requireHandle(caller, input.handle, origin);
-        await release(entry, input.shutdown, signal);
-        sessions.delete(sessionKey(caller));
+        const entry = requireHandle(caller, input.handle, origin, true);
+        await release(entry, "close", input.shutdown, signal);
       });
     },
     async detach(caller: DeviceCaller) {
@@ -354,26 +401,32 @@ export function createDeviceController(runtime: DeviceRuntime) {
       return transition(caller, async () => {
         const entry = sessions.get(sessionKey(caller));
         if (!entry) return;
-        await release(entry);
-        sessions.delete(sessionKey(caller));
+        await release(entry, "close");
       });
     },
     async dispose() {
-      disposed = true;
+      lifetime.abort();
       for (const abort of opening.values()) abort.abort();
       await Promise.all(preparing.keys());
       await Promise.all(transitions.values());
-      await Promise.all([...retiring.values()].map((cleanup) => cleanup.pending));
-      await Promise.allSettled([...retiring.keys()].map((entry) => release(entry)));
-      retiring.clear();
-      await Promise.all([...new Set(devices.values())].map((entry) => entry.pending));
+      const entries = [...new Set(devices.values())].filter((slot) => "device" in slot);
+      const results = await Promise.allSettled(entries.map(finishCleanup));
+      await Promise.all(entries.map((entry) => entry.queue.drain()));
       sessions.clear();
-      devices.clear();
-      for (const [key, device] of rollbacks) {
-        await runtime.close({ handle: device.handle, shutdown: true });
-        rollbacks.delete(key);
-      }
-      await runtime.dispose();
+      // Runtime disposal must still run when rollback cleanup fails.
+      results.push(
+        ...(await Promise.allSettled([
+          runtime.dispose().then(() => {
+            for (const entry of entries) {
+              if (entry.state.type !== "attached") continue;
+              entry.state = { type: "released" };
+              forget(entry);
+            }
+          }),
+        ])),
+      );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
     },
   };
 }

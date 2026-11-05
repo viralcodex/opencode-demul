@@ -113,29 +113,26 @@ export async function ensureHelpers(
   dir: string,
   timeoutMs = 300_000,
   node = "node",
+  signal?: AbortSignal,
 ): Promise<HelperPaths> {
+  signal?.throwIfAborted();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await validateHelperDirectory(dir);
   const stamp = join(dir, ".helper-lock.sha256");
   for (const file of [stamp, join(dir, "package.json"), join(dir, "package-lock.json")]) {
     await trustedPath(dir, file);
   }
-  const previousHash = await readFile(stamp, "utf8").catch(() => null);
-  const existing = await resolveHelperPaths(dir);
-  if (existing && previousHash?.trim() === HELPER_LOCK_HASH) return existing;
+  const existing = await currentHelpers(dir, stamp);
+  if (existing) return existing;
 
   await rm(stamp, { force: true });
   await writeFile(join(dir, "package.json"), `${JSON.stringify(helperPackage, null, 2)}\n`);
   await writeFile(join(dir, "package-lock.json"), `${JSON.stringify(helperLock, null, 2)}\n`);
-  const npmCli = await resolveNpmCli(node);
+  const npmCli = await resolveNpmCli(node, signal);
   const projectDir = await realpath(dir);
   const { command, args } = installArgs(projectDir, node, npmCli);
-  const paths = process.platform === "win32" ? win32 : posix;
-  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  const env = {
-    [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter),
-  };
-  const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env });
+  const env = installEnv(node);
+  const result = await runCommand({ command, args, timeoutMs, cwd: projectDir, env, signal });
   requireInstall(result);
   const resolved = await resolveHelperPaths(dir);
   if (!resolved)
@@ -145,6 +142,20 @@ export async function ensureHelpers(
     );
   await writeFile(stamp, `${HELPER_LOCK_HASH}\n`);
   return resolved;
+}
+
+async function currentHelpers(dir: string, stamp: string): Promise<HelperPaths | null> {
+  const [hash, paths] = await Promise.all([
+    readFile(stamp, "utf8").catch(() => null),
+    resolveHelperPaths(dir),
+  ]);
+  return hash?.trim() === HELPER_LOCK_HASH ? paths : null;
+}
+
+function installEnv(node: string): Record<string, string> {
+  const paths = process.platform === "win32" ? win32 : posix;
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  return { [pathKey]: [paths.dirname(node), process.env[pathKey] ?? ""].join(paths.delimiter) };
 }
 
 function requireInstall(result: CommandResult): void {
@@ -196,20 +207,29 @@ function manifestBin(
 
 // Resolve the external Node binary the helpers run under and verify it meets the automation engine's minimum. The
 // candidate comes from the explicit option, then `OPENCODE_DEVICE_NODE`, then PATH with installed NVM versions as fallback.
-export async function resolveExternalNode(candidate?: string, timeoutMs = 10_000): Promise<string> {
+export async function resolveExternalNode(
+  candidate?: string,
+  timeoutMs = 10_000,
+  signal?: AbortSignal,
+): Promise<string> {
   const configured = candidate ?? process.env["OPENCODE_DEVICE_NODE"];
   try {
-    return await validateExternalNode(configured ?? "node", timeoutMs);
+    return await validateExternalNode(configured ?? "node", timeoutMs, signal);
   } catch (error) {
+    signal?.throwIfAborted();
     if (configured !== undefined) throw error;
     const installed = await nvmNodeCandidates(process.env["NVM_DIR"] ?? join(homedir(), ".nvm"));
-    if (installed[0]) return validateExternalNode(installed[0], timeoutMs);
+    if (installed[0]) return validateExternalNode(installed[0], timeoutMs, signal);
     throw error;
   }
 }
 
-async function validateExternalNode(node: string, timeoutMs: number): Promise<string> {
-  const result = await runCommand({ command: node, args: ["--version"], timeoutMs });
+async function validateExternalNode(
+  node: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const result = await runCommand({ command: node, args: ["--version"], timeoutMs, signal });
   const version = parseNodeVersion(result.stdout) ?? parseNodeVersion(result.stderr);
   if (result.code !== 0 || !version) {
     const reason = result.spawnError ?? result.stderr.trim();
@@ -228,6 +248,7 @@ async function validateExternalNode(node: string, timeoutMs: number): Promise<st
     command: node,
     args: ["--print", "process.execPath"],
     timeoutMs,
+    signal,
   });
   if (executable.code !== 0 || !executable.stdout.trim())
     throw deviceError(
@@ -270,7 +291,8 @@ export function npmCliCandidates(
   ];
 }
 
-export async function resolveNpmCli(node: string): Promise<string> {
+export async function resolveNpmCli(node: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const adjacent =
     process.platform === "win32"
       ? undefined
@@ -282,13 +304,22 @@ export async function resolveNpmCli(node: string): Promise<string> {
       command: node,
       args: [candidate, "--version"],
       timeoutMs: 10_000,
+      signal,
     });
-    if (result.code === 0 && !result.timedOut && !result.signal && parseNodeVersion(result.stdout))
-      return candidate;
+    if (validNpmResult(result)) return candidate;
   }
   throw deviceError(
     "missing-prerequisite",
     "npm is unavailable. Install Node with npm and make it available to OpenCode Desktop.",
+  );
+}
+
+function validNpmResult(result: CommandResult): boolean {
+  return (
+    result.code === 0 &&
+    !result.timedOut &&
+    !result.signal &&
+    parseNodeVersion(result.stdout) !== null
   );
 }
 

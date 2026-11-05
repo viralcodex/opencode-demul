@@ -22,10 +22,19 @@ export interface PlatformBackend {
   readonly env: Record<string, string> | undefined;
   // Resolves once the hub serves the device's screen.
   streamReady(stream: Device.StreamDescriptor, signal?: AbortSignal): Promise<void>;
-  tap(stream: Device.StreamDescriptor, point: ScreenPoint): Promise<void>;
-  swipe(stream: Device.StreamDescriptor, from: ScreenPoint, to: ScreenPoint): Promise<void>;
+  tap(stream: Device.StreamDescriptor, point: ScreenPoint, signal?: AbortSignal): Promise<void>;
+  swipe(
+    stream: Device.StreamDescriptor,
+    from: ScreenPoint,
+    to: ScreenPoint,
+    signal?: AbortSignal,
+  ): Promise<void>;
   // Press a key through the hub, resolving false when the automation engine should handle it instead.
-  pressKey(stream: Device.StreamDescriptor, key: Device.NavigationKey): Promise<boolean>;
+  pressKey(
+    stream: Device.StreamDescriptor,
+    key: Device.NavigationKey,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
 }
 
 export function androidBackend(androidSdkRoot: string | undefined): PlatformBackend {
@@ -39,16 +48,20 @@ export function androidBackend(androidSdkRoot: string | undefined): PlatformBack
     shutdown: (serial) => shutdownEmulator(options, serial),
     env: androidHelperEnv(androidSdkRoot),
     streamReady: (stream, signal) => ServeEmu.waitForScreen(stream, { signal }),
-    tap: (stream, point) => sendGesture(stream, { type: "tap", ...point }),
-    swipe: (stream, from, to) =>
-      sendGesture(stream, {
-        type: "swipe",
-        x1: from.x,
-        y1: from.y,
-        x2: to.x,
-        y2: to.y,
-        durationMs: 300,
-      }),
+    tap: (stream, point, signal) => sendGesture(stream, { type: "tap", ...point }, signal),
+    swipe: (stream, from, to, signal) =>
+      sendGesture(
+        stream,
+        {
+          type: "swipe",
+          x1: from.x,
+          y1: from.y,
+          x2: to.x,
+          y2: to.y,
+          durationMs: 300,
+        },
+        signal,
+      ),
     pressKey: async () => false,
   };
 }
@@ -63,9 +76,9 @@ export function iosBackend(): PlatformBackend {
     tap: ServeSim.tap,
     swipe: ServeSim.swipe,
     // The automation engine cannot press lock or volume on a simulator, so hardware buttons go through the hub.
-    pressKey: async (stream, key) => {
+    pressKey: async (stream, key, signal) => {
       if (!ServeSim.isHidButton(key)) return false;
-      await ServeSim.pressButton(stream, key);
+      await ServeSim.pressButton(stream, key, signal);
       return true;
     },
   };

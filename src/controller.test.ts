@@ -153,21 +153,129 @@ test.each([false, true])(
   },
 );
 
-test("failed shutdown rejects close and preserves the session for retry", async () => {
+test.each(["close", "reopen"])(
+  "failed cleanup quarantines the handle and retains shutdown intent through %s",
+  async (recovery) => {
+    const item = fixture();
+    const first = await item.controller.open(caller, selection, "manual");
+    const close = item.runtime.close;
+    item.runtime.close = async () => {
+      throw deviceError("timeout", "cleanup incomplete", true);
+    };
+    await expect(
+      item.controller.close(caller, { handle: first.handle, shutdown: true }, "manual"),
+    ).rejects.toMatchObject({ data: { code: "timeout", mayHaveExecuted: true } });
+    expect(item.controller.state(caller)?.handle).toEqual(first.handle);
+    await expect(
+      item.controller.run(caller, { type: "apps", handle: first.handle }, "agent"),
+    ).rejects.toMatchObject({ code: "detached" });
+    await expect(
+      item.controller.open({ ...caller, sessionID: "other" }, selection, "manual"),
+    ).rejects.toMatchObject({ code: "device-busy" });
+    item.runtime.close = close;
+    if (recovery === "close") {
+      await item.controller.close(caller, { handle: first.handle }, "manual");
+      expect(item.controller.state(caller)).toBeNull();
+      expect(item.calls).toEqual(["open", "close"]);
+    } else {
+      const next = await item.controller.open(caller, selection, "manual");
+      expect(next.handle.token).not.toBe(first.handle.token);
+      expect(item.calls).toEqual(["open", "close", "open"]);
+    }
+    expect(item.closes[0]?.shutdown).toBe(true);
+    await item.controller.dispose();
+  },
+);
+
+test("a failed physical-alias rollback keeps both handles isolated and remains reserved", async () => {
   const item = fixture();
-  const opened = await item.controller.open(caller, selection, "manual");
+  const open = item.runtime.open;
+  item.runtime.open = (input) => open({ ...input, deviceId: "serial" });
+  const first = await item.controller.open(caller, selection, "manual");
+  const close = item.runtime.close;
+  const other = { ...caller, sessionID: "other" };
+  const alias = { ...selection, deviceId: "alias" };
+  item.runtime.close = async () => {
+    throw deviceError("timeout", "cleanup incomplete");
+  };
+  await expect(item.controller.open(other, alias, "manual")).rejects.toMatchObject({
+    code: "timeout",
+  });
+  await expect(
+    item.controller.open({ ...caller, sessionID: "third" }, alias, "manual"),
+  ).rejects.toMatchObject({ code: "device-busy" });
+  expect(item.calls).toEqual(["open", "open"]);
+  expect(item.controller.state(caller)?.handle).toEqual(first.handle);
+  item.runtime.close = close;
+  await expect(item.controller.open(other, alias, "manual")).rejects.toMatchObject({
+    code: "device-busy",
+  });
+  expect(
+    item.closes.every((input) => input.handle.token !== first.handle.token && !input.shutdown),
+  ).toBe(true);
+  await item.controller.dispose();
+});
+
+test("failed retirement remains retryable after disposal reports its error", async () => {
+  const item = fixture();
+  const first = await item.controller.open(caller, selection, "manual");
   const close = item.runtime.close;
   item.runtime.close = async () => {
-    throw deviceError("timeout", "Android shutdown timed out.", true);
+    throw deviceError("timeout", "cleanup incomplete");
+  };
+  await item.controller.open(caller, { ...selection, deviceId: "other" }, "manual");
+  await expect(item.controller.dispose()).rejects.toMatchObject({ code: "timeout" });
+  expect(item.calls).toContain("dispose");
+  item.runtime.close = close;
+  await item.controller.dispose();
+  expect(item.closes.map((input) => input.handle)).toEqual([first.handle]);
+  expect(item.calls.filter((call) => call === "dispose")).toHaveLength(2);
+});
+
+test("cancelling a close before dispatch restores the attached state", async () => {
+  const item = fixture();
+  const { handle } = await item.controller.open(caller, selection, "manual");
+  const action = item.controller.run(caller, { type: "key", handle, key: "home" }, "agent");
+  await item.started.promise;
+  const abort = new AbortController();
+  const closing = item.controller.close(caller, { handle }, "manual", abort.signal);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(() => item.controller.access(caller, false)).toThrow(
+    "This session is changing its device.",
+  );
+  abort.abort();
+  item.release.resolve();
+  await action;
+  await expect(closing).rejects.toMatchObject({ name: "AbortError" });
+  await expect(
+    item.controller.run(caller, { type: "apps", handle }, "agent"),
+  ).resolves.toMatchObject({ type: "apps" });
+  expect(item.closes).toEqual([]);
+  await item.controller.dispose();
+});
+
+test("failed rollback cleanup does not skip runtime disposal or prevent a later cleanup retry", async () => {
+  const item = fixture();
+  const open = item.runtime.open;
+  const close = item.runtime.close;
+  const abort = new AbortController();
+  item.runtime.open = async (input) => {
+    const result = await open(input);
+    abort.abort();
+    return result;
+  };
+  item.runtime.close = async () => {
+    throw deviceError("timeout", "cleanup failed");
   };
   await expect(
-    item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual"),
-  ).rejects.toMatchObject({ data: { code: "timeout", mayHaveExecuted: true } });
-  expect(item.controller.state(caller)?.handle).toEqual(opened.handle);
+    item.controller.open(caller, selection, "manual", abort.signal),
+  ).rejects.toMatchObject({ code: "timeout" });
+  await expect(item.controller.dispose()).rejects.toMatchObject({ code: "timeout" });
+  expect(item.calls).toContain("dispose");
   item.runtime.close = close;
-  await item.controller.close(caller, { handle: opened.handle, shutdown: true }, "manual");
-  expect(item.controller.state(caller)).toBeNull();
   await item.controller.dispose();
+  expect(item.calls).toEqual(["open", "dispose", "close", "dispose"]);
 });
 
 test("agent access defaults on, can be revoked, and never exposes the stream token in attachment state", async () => {

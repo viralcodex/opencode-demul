@@ -314,7 +314,11 @@ export function createMainSetup(
       stream: async (input, ipcCaller) => {
         const connection = current(input.scope, ipcCaller.window);
         return deviceStreamOutcome(async () => {
-          const raw = await getController().stream(caller(connection), input.handle);
+          const raw = await getController().stream(
+            caller(connection),
+            input.handle,
+            AbortSignal.any([connection.abort.signal, ipcCaller.signal]),
+          );
           requireStream(connection, input, ipcCaller.window, ipcCaller.signal);
           if (
             connection.proxy &&
@@ -418,6 +422,12 @@ function failure(error: unknown) {
     return {
       code: "detached" as const,
       message: "The pending device request was cancelled.",
+      mayHaveExecuted: false,
+    };
+  if (error instanceof Error && error.name === "TimeoutError")
+    return {
+      code: "timeout" as const,
+      message: "The queued device request exceeded its deadline.",
       mayHaveExecuted: false,
     };
   return {

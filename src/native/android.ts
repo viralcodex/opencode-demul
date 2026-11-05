@@ -128,18 +128,14 @@ export async function ensureBooted(
   } = {},
 ): Promise<BootedDevice> {
   const run = dependencies.run ?? runCommand;
-  dependencies.signal?.throwIfAborted();
-  const existing = await resolveRunningSerial(options, avdName, (spec) =>
-    run({ ...spec, signal: dependencies.signal }),
+  const existing = await runningSerialForBoot(
+    options,
+    avdName,
+    bootIntent,
+    run,
+    dependencies.signal,
   );
-  dependencies.signal?.throwIfAborted();
   if (existing) return { serial: existing, bootedByUs: false };
-  if (!bootIntent) {
-    throw deviceError(
-      "not-found",
-      `The device "${avdName}" is not booted; open it with boot enabled.`,
-    );
-  }
   const bootTimeoutMs = options.timeoutMs ?? 180_000;
   const report = await consoleReport();
   const abort = new AbortController();
@@ -200,6 +196,25 @@ export async function ensureBooted(
     abort.abort();
     report.close();
   }
+}
+
+async function runningSerialForBoot(
+  options: AndroidOptions,
+  avdName: string,
+  bootIntent: boolean,
+  run: typeof runCommand,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  signal?.throwIfAborted();
+  const existing = await resolveRunningSerial(options, avdName, (spec) => run({ ...spec, signal }));
+  signal?.throwIfAborted();
+  if (existing) return existing;
+  if (!bootIntent)
+    throw deviceError(
+      "not-found",
+      `The device "${avdName}" is not booted; open it with boot enabled.`,
+    );
+  return null;
 }
 
 async function consoleReport() {

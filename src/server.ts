@@ -7,6 +7,7 @@ import { Tool } from "@opencode/schema/tool";
 import { Deferred, Effect, Option, Schema, Stream } from "effect";
 import { DeviceBridge } from "./bridge.js";
 import { Device } from "./rpc.js";
+import { DEVICE_REQUEST_TIMEOUT_MS } from "./deadlines.js";
 
 // Session-bound desktop state. Each pending request is claimed once and completed through the result RPC.
 interface Attachment {
@@ -34,6 +35,21 @@ const unavailable = <Failure>(
   message: string,
 ) => call.error("unavailable", message, { code, message, mayHaveExecuted: false });
 
+const adopt = Effect.fnUntraced(function* (
+  device: DeviceBridge.Attachment,
+  operation: Extract<DeviceBridge.Operation, { type: "open" }>,
+) {
+  if (
+    device.handle.platform !== operation.platform ||
+    device.handle.deviceId !== operation.deviceId
+  )
+    return yield* new Tool.Error({
+      message:
+        "[device.unavailable] A different device is attached to this session. The agent can only adopt the device already open in the desktop app. Call the state tool to read the attached device.",
+    });
+  return { type: "attachment" as const, attachment: device };
+});
+
 export const make = Effect.fn("DeviceServer.make")(function* (
   ctx: Pick<Context, "rpc" | "session" | "location" | "event">,
 ) {
@@ -41,13 +57,15 @@ export const make = Effect.fn("DeviceServer.make")(function* (
   let active = true;
   // Resolving `closed` unblocks every parked request through its race below, so a detached or replaced connection
   // reports each in-flight action as conservatively unknown rather than silently dropping it.
-  const close = (sessionID: string, reason: "closed" | "replaced" = "closed") =>
-    Effect.gen(function* () {
-      const attachment = attachments.get(sessionID);
-      if (!attachment) return;
-      attachments.delete(sessionID);
-      yield* Deferred.succeed(attachment.closed, reason);
-    });
+  const close = Effect.fnUntraced(function* (
+    sessionID: string,
+    reason: "closed" | "replaced" = "closed",
+  ) {
+    const attachment = attachments.get(sessionID);
+    if (!attachment) return;
+    attachments.delete(sessionID);
+    yield* Deferred.succeed(attachment.closed, reason);
+  });
   yield* Effect.addFinalizer(() => {
     active = false;
     return Effect.forEach(attachments.keys(), (id) => close(id), { discard: true });
@@ -130,7 +148,8 @@ export const make = Effect.fn("DeviceServer.make")(function* (
             return yield* Deferred.fail(
               pending.result,
               new Tool.Error({
-                message: `[device.${input.outcome.error.code}] ${input.outcome.error.message}`,
+                message: `[device.${input.outcome.error.code}] ${input.outcome.error.message}${input.outcome.error.mayHaveExecuted ? " The action may already have run. Re-read device state before retrying a mutating action." : ""}`,
+                error: input.outcome.error,
               }),
             ).pipe(Effect.asVoid);
           yield* Deferred.succeed(pending.result, input.outcome.value);
@@ -184,10 +203,10 @@ export const make = Effect.fn("DeviceServer.make")(function* (
           ),
         ),
         Effect.timeoutOrElse({
-          duration: "60 seconds",
+          duration: DEVICE_REQUEST_TIMEOUT_MS,
           orElse: () =>
             new Tool.Error({
-              message: `[device.timeout] device.${operation.type} did not finish within 60 seconds; its outcome is unknown. Check the desktop connection and re-read device state before repeating a mutating action.`,
+              message: `[device.timeout] device.${operation.type} did not finish within ${DEVICE_REQUEST_TIMEOUT_MS / 1_000} seconds; its outcome is unknown. Check the desktop connection and re-read device state before repeating a mutating action.`,
             }),
         }),
         Effect.ensuring(Effect.sync(() => void attachment.pending.delete(requestID))),
@@ -219,17 +238,7 @@ export const make = Effect.fn("DeviceServer.make")(function* (
         });
       const device = attachment.state;
       // Open only adopts the device the desktop already attached; the agent never boots or picks a new one.
-      if (operation.type === "open") {
-        if (
-          device.handle.platform !== operation.platform ||
-          device.handle.deviceId !== operation.deviceId
-        )
-          return yield* new Tool.Error({
-            message:
-              "[device.unavailable] A different device is attached to this session. The agent can only adopt the device already open in the desktop app. Call the state tool to read the attached device.",
-          });
-        return { type: "attachment" as const, attachment: device };
-      }
+      if (operation.type === "open") return yield* adopt(device, operation);
       // Device-bound operations must target the attached handle, so a stale handle is rejected before dispatch.
       if (!Device.sameHandle(device.handle, operation.handle))
         return yield* new Tool.Error({

@@ -1,25 +1,12 @@
-import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Device } from "../rpc.js";
 import type { DeviceBridge } from "../bridge.js";
 import {
-  appsArgs,
   capabilitiesArgs,
-  closeArgs,
   createAutomation,
-  fillArgs,
-  installArgs,
-  keyArgs,
-  launchArgs,
-  parseApps,
   parseCapabilities,
-  parseSnapshotJson,
-  pressArgs,
-  screenshotArgs,
-  snapshotArgs,
-  swipeArgs,
-  tapArgs,
   type Automation,
 } from "./automation.js";
 import { deviceError } from "./errors.js";
@@ -32,23 +19,26 @@ import {
   resolveExternalNode,
   type HelperPaths,
 } from "./helpers.js";
-import { startHub, type HubSession } from "./hub.js";
-import { readPngDimensions } from "./png.js";
+import { startHub } from "./hub.js";
+import { HubConnection } from "./hub-connection.js";
+import { DeviceResources } from "./resources.js";
+import { createDeviceOperations, type ActiveDevice } from "./operations.js";
+import { waitWithSignal } from "../cancellation.js";
 
 export interface DeviceRuntime {
   list(platform?: Device.Platform, signal?: AbortSignal): Promise<Device.DeviceInfo[]>;
   open(input: OpenInput, signal?: AbortSignal): Promise<OpenResult>;
-  apps(handle: Device.DeviceHandle): Promise<Device.AppInfo[]>;
-  launch(input: LaunchInput): Promise<Device.LaunchResult>;
-  install(input: InstallInput): Promise<Device.InstallResult>;
-  snapshot(input: SnapshotInput): Promise<Device.Snapshot>;
-  press(input: PressInput): Promise<void>;
-  tap(input: TapInput): Promise<void>;
-  fill(input: FillInput): Promise<void>;
-  swipe(input: SwipeInput): Promise<void>;
-  key(input: KeyInput): Promise<void>;
-  screenshot(handle: Device.DeviceHandle): Promise<Device.Screenshot>;
-  stream(handle: Device.DeviceHandle): Promise<Device.StreamDescriptor>;
+  apps(handle: Device.DeviceHandle, signal?: AbortSignal): Promise<Device.AppInfo[]>;
+  launch(input: LaunchInput, signal?: AbortSignal): Promise<Device.LaunchResult>;
+  install(input: InstallInput, signal?: AbortSignal): Promise<Device.InstallResult>;
+  snapshot(input: SnapshotInput, signal?: AbortSignal): Promise<Device.Snapshot>;
+  press(input: PressInput, signal?: AbortSignal): Promise<void>;
+  tap(input: TapInput, signal?: AbortSignal): Promise<void>;
+  fill(input: FillInput, signal?: AbortSignal): Promise<void>;
+  swipe(input: SwipeInput, signal?: AbortSignal): Promise<void>;
+  key(input: KeyInput, signal?: AbortSignal): Promise<void>;
+  screenshot(handle: Device.DeviceHandle, signal?: AbortSignal): Promise<Device.Screenshot>;
+  stream(handle: Device.DeviceHandle, signal?: AbortSignal): Promise<Device.StreamDescriptor>;
   close(input: CloseInput): Promise<void>;
   // Release attachment resources without shutting down devices.
   dispose(): Promise<void>;
@@ -80,49 +70,52 @@ export interface RuntimeOptions {
   androidSdkRoot?: string;
 }
 
-// Every contract capability, used to report the complement of what a device supports.
-const ALL_CAPABILITIES: readonly Device.Capability[] = [
-  "apps",
-  "launch",
-  "install",
-  "snapshot",
-  "press",
-  "fill",
-  "swipe",
-  "key",
-  "screenshot",
-  "stream",
-];
-
-interface Attachment {
-  handle: Device.DeviceHandle;
-  backend: PlatformBackend;
-  hub: HubSession;
-  automation: Automation;
-  capabilities: Device.Capabilities;
-  stateDir: string;
-  // Shutdown is honored only for a device booted by this runtime.
-  bootedByUs: boolean;
+interface Attachment extends ActiveDevice {
+  resources: DeviceResources;
 }
 
-export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime {
+export interface RuntimeDependencies {
+  backends?: Partial<Record<Device.Platform, PlatformBackend>>;
+  resolveNode?: typeof resolveExternalNode;
+  helpers?: typeof ensureHelpers;
+  hub?: typeof startHub;
+  automation?: typeof createAutomation;
+}
+
+export function createNativeRuntime(
+  options: RuntimeOptions = {},
+  dependencies: RuntimeDependencies = {},
+): DeviceRuntime {
   const helperDir = options.helperDir ?? defaultHelperDir();
   const stateRoot = options.stateRoot ?? join(tmpdir(), "opencode-device-sessions");
-  const backends: Partial<Record<Device.Platform, PlatformBackend>> = {
+  const backends: Partial<Record<Device.Platform, PlatformBackend>> = dependencies.backends ?? {
     android: androidBackend(resolveAndroidSdkRoot({ root: options.androidSdkRoot })),
     ...(process.platform === "darwin" ? { ios: iosBackend() } : {}),
   };
   const attachments = new Map<string, Attachment>();
+  const failedOpens = new Map<string, DeviceResources>();
+  const registry = new HandleRegistry();
+  const lifetime = new AbortController();
+  const pendingOpens = new Set<Promise<void>>();
   let resolvedNode: Promise<string> | null = null;
   let installedHelpers: Promise<HelperPaths> | null = null;
 
   const node = () =>
-    (resolvedNode ??= resolveExternalNode(options.externalNode).catch((error) => {
+    (resolvedNode ??= (dependencies.resolveNode ?? resolveExternalNode)(
+      options.externalNode,
+      undefined,
+      lifetime.signal,
+    ).catch((error) => {
       resolvedNode = null;
       throw error;
     }));
   const helpers = (externalNode: string) =>
-    (installedHelpers ??= ensureHelpers(helperDir, 300_000, externalNode).catch((error) => {
+    (installedHelpers ??= (dependencies.helpers ?? ensureHelpers)(
+      helperDir,
+      300_000,
+      externalNode,
+      lifetime.signal,
+    ).catch((error) => {
       installedHelpers = null;
       throw error;
     }));
@@ -135,6 +128,8 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
         "detached",
         "This device handle is no longer attached; open the device again.",
       );
+    if (found.resources.closing)
+      throw deviceError("detached", "Device cleanup is incomplete; retry closing this attachment.");
     if (capability && !found.capabilities.supported.includes(capability)) {
       const reason = found.capabilities.unsupported.find(
         (entry) => entry.capability === capability,
@@ -143,8 +138,6 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
     }
     return found;
   };
-
-  const registry = new HandleRegistry();
 
   const backendFor = (platform: Device.Platform) => {
     if (!["darwin", "linux", "win32"].includes(process.platform))
@@ -156,7 +149,8 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
 
   return {
     async list(platform, signal) {
-      signal?.throwIfAborted();
+      signal = AbortSignal.any([lifetime.signal, ...(signal ? [signal] : [])]);
+      signal.throwIfAborted();
       if (platform) return backendFor(platform).list(signal);
       const platforms = Object.keys(backends) as Device.Platform[];
       // One platform's missing toolchain must not hide the other platform's devices.
@@ -174,236 +168,19 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
       return listed;
     },
 
-    async open(input, signal) {
-      signal?.throwIfAborted();
-      const backend = backendFor(input.platform);
-      const externalNode = await node();
-      const paths = await helpers(externalNode);
-      signal?.throwIfAborted();
-      const { deviceId, bootedByUs } = await backend.ensureBooted(
-        input.deviceId,
-        input.boot ?? false,
-        signal,
+    open(input, signal) {
+      const combined = AbortSignal.any([lifetime.signal, ...(signal ? [signal] : [])]);
+      const result = openDevice(input, combined);
+      const pending = result.then(
+        () => undefined,
+        () => undefined,
       );
-      // Everything acquired past this point is torn down in reverse if a later step throws, so a failed open never
-      // leaks the device we booted, the hub we spawned, the handle we minted, or the state directory we created.
-      const cleanups: Array<() => Promise<void>> = [];
-      if (bootedByUs) cleanups.push(() => backend.shutdown(deviceId));
-      try {
-        signal?.throwIfAborted();
-        const env = backend.env;
-        const hub = await startHub({
-          externalNode,
-          hubCli: paths.hubCli,
-          platform: input.platform,
-          deviceId,
-          env,
-          signal,
-        });
-        cleanups.push(() => hub.stop().catch(() => undefined));
-        const handle = registry.create(input.platform, deviceId);
-        cleanups.push(async () => registry.release(handle));
-        const stateDir = join(stateRoot, handle.token);
-        await mkdir(stateDir, { recursive: true, mode: 0o700 });
-        cleanups.push(() => rm(stateDir, { recursive: true, force: true }).catch(() => undefined));
-        const automation = createAutomation({
-          externalNode,
-          agentDeviceBin: paths.agentDeviceBin,
-          platform: input.platform,
-          deviceId,
-          stateDir,
-          env,
-        });
-        cleanups.push(async () => {
-          await automation.run(closeArgs(), 10_000).catch(() => undefined);
-        });
-        const [screen, controls] = await Promise.allSettled([
-          backend.streamReady(hub.descriptor, signal),
-          openAutomation(automation, signal),
-        ]);
-        if (screen.status === "rejected") throw screen.reason;
-        if (controls.status === "rejected") throw controls.reason;
-        const capabilities = controls.value;
-        attachments.set(handle.token, {
-          handle,
-          backend,
-          hub,
-          automation,
-          capabilities,
-          stateDir,
-          bootedByUs,
-        });
-        return { handle, capabilities };
-      } catch (error) {
-        for (const cleanup of cleanups.reverse()) await cleanup();
-        throw error;
-      }
+      pendingOpens.add(pending);
+      void pending.then(() => pendingOpens.delete(pending));
+      return result;
     },
 
-    async apps(handle) {
-      const found = attachment(handle, "apps");
-      const result = found.automation.require(
-        await found.automation.run(appsArgs()),
-        "Listing apps",
-      );
-      const apps = parseApps(result.stdout);
-      if (!apps) throw deviceError("helper-failed", "The app listing could not be read.");
-      return apps;
-    },
-
-    async launch(input) {
-      const found = attachment(input.handle, "launch");
-      found.automation.require(
-        await found.automation.run(launchArgs(input.app, input.deepLink, input.relaunch)),
-        "Launching the app",
-        true,
-      );
-      registry.invalidate(input.handle);
-      return { app: input.app, state: "launched" };
-    },
-
-    async install(input) {
-      const found = attachment(input.handle, "install");
-      found.automation.require(
-        await found.automation.run(installArgs(input.artifactPath)),
-        "Installing the artifact",
-        true,
-      );
-      return { installed: true };
-    },
-
-    async snapshot(input) {
-      const found = attachment(input.handle, "snapshot");
-      const interactiveOnly = input.interactiveOnly ?? true;
-      const result = found.automation.require(
-        await found.automation.run(snapshotArgs(interactiveOnly)),
-        "Taking a snapshot",
-      );
-      const parsed = parseSnapshotJson(result.stdout);
-      if (!parsed) throw deviceError("helper-failed", "The snapshot could not be read.");
-      const revision = registry.nextSnapshot(input.handle);
-      return {
-        token: input.handle.token,
-        generation: input.handle.generation,
-        revision,
-        interactiveOnly,
-        complete: parsed.complete,
-        nodes: parsed.nodes,
-      };
-    },
-
-    async press(input) {
-      const found = attachment(input.handle, "press");
-      const ref = registry.resolveReference(input.reference, input.handle);
-      found.automation.require(
-        await found.automation.run(pressArgs(ref)),
-        "Pressing the element",
-        true,
-      );
-      registry.invalidate(input.handle);
-    },
-
-    async tap(input) {
-      const found = attachment(input.handle, input.viewport ? "stream" : "press");
-      if (input.viewport) {
-        await found.backend.tap(found.hub.descriptor, {
-          x: input.point.x / input.viewport.width,
-          y: input.point.y / input.viewport.height,
-        });
-        registry.invalidate(input.handle);
-        return;
-      }
-      found.automation.require(
-        await found.automation.run(tapArgs(input.point)),
-        "Tapping the point",
-        true,
-      );
-      registry.invalidate(input.handle);
-    },
-
-    async fill(input) {
-      const found = attachment(input.handle, "fill");
-      const ref = registry.resolveReference(input.reference, input.handle);
-      found.automation.require(
-        await found.automation.run(fillArgs(ref, input.text)),
-        "Filling the field",
-        true,
-      );
-      registry.invalidate(input.handle);
-    },
-
-    async swipe(input) {
-      const found = attachment(input.handle, input.viewport ? "stream" : "swipe");
-      if (input.viewport) {
-        const { width, height } = input.viewport;
-        await found.backend.swipe(
-          found.hub.descriptor,
-          { x: input.from.x / width, y: input.from.y / height },
-          { x: input.to.x / width, y: input.to.y / height },
-        );
-        registry.invalidate(input.handle);
-        return;
-      }
-      found.automation.require(
-        await found.automation.run(swipeArgs(input.from, input.to)),
-        "Swiping",
-        true,
-      );
-      registry.invalidate(input.handle);
-    },
-
-    async key(input) {
-      const found = attachment(input.handle, "key");
-      if (!(await found.backend.pressKey(found.hub.descriptor, input.key)))
-        found.automation.require(
-          await found.automation.run(keyArgs(input.key)),
-          "Pressing the key",
-          true,
-        );
-      registry.invalidate(input.handle);
-    },
-
-    async screenshot(handle) {
-      const found = attachment(handle, "screenshot");
-      const path = join(found.stateDir, `screenshot-${crypto.randomUUID()}.png`);
-      try {
-        found.automation.require(
-          await found.automation.run(screenshotArgs(path)),
-          "Capturing a screenshot",
-        );
-        const file = await lstat(path).catch(() => null);
-        if (!file?.isFile())
-          throw deviceError("invalid-artifact", "The screenshot helper wrote no readable file.");
-        if (file.size > Device.MAX_SCREENSHOT_BYTES)
-          throw deviceError(
-            "invalid-artifact",
-            "The screenshot exceeded the maximum allowed size.",
-          );
-        const data = await readFile(path).catch(() => null);
-        if (!data)
-          throw deviceError("invalid-artifact", "The screenshot helper wrote no readable file.");
-        if (data.byteLength > Device.MAX_SCREENSHOT_BYTES)
-          throw deviceError(
-            "invalid-artifact",
-            "The screenshot exceeded the maximum allowed size.",
-          );
-        const dimensions = readPngDimensions(data);
-        if (!dimensions)
-          throw deviceError("invalid-artifact", "The screenshot was not a readable PNG.");
-        return {
-          data,
-          ...dimensions,
-          deviceId: found.handle.deviceId,
-          platform: found.handle.platform,
-        };
-      } finally {
-        await rm(path, { force: true }).catch(() => undefined);
-      }
-    },
-
-    async stream(handle) {
-      return attachment(handle).hub.descriptor;
-    },
+    ...createDeviceOperations(attachment, registry),
 
     async close(input) {
       const found = attachments.get(input.handle.token);
@@ -415,28 +192,123 @@ export function createNativeRuntime(options: RuntimeOptions = {}): DeviceRuntime
           "This device handle is no longer attached; open the device again.",
         );
       }
-      if (input.shutdown && found.bootedByUs) await found.backend.shutdown(found.handle.deviceId);
+      await found.resources.close(input.shutdown);
       attachments.delete(input.handle.token);
       registry.release(input.handle);
-      await teardown(found);
     },
 
     async dispose() {
-      const entries = [...attachments.values()];
-      attachments.clear();
-      for (const entry of entries) {
-        registry.release(entry.handle);
-        await teardown(entry);
-      }
+      lifetime.abort();
+      await Promise.all(pendingOpens);
+      await Promise.allSettled([resolvedNode, installedHelpers]);
+      const results = await Promise.allSettled([
+        ...[...attachments.values()].map(async (entry) => {
+          await entry.resources.close();
+          registry.release(entry.handle);
+          attachments.delete(entry.handle.token);
+        }),
+        ...[...failedOpens].map(async ([key, resources]) => {
+          await resources.close(true);
+          failedOpens.delete(key);
+        }),
+      ]);
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
     },
   };
 
-  async function teardown(entry: Attachment): Promise<void> {
-    await Promise.all([
-      entry.automation.run(closeArgs(), 10_000).catch(() => undefined),
-      entry.hub.stop().catch(() => undefined),
-    ]);
-    await rm(entry.stateDir, { recursive: true, force: true }).catch(() => undefined);
+  async function openDevice(input: OpenInput, signal: AbortSignal): Promise<OpenResult> {
+    signal.throwIfAborted();
+    const backend = backendFor(input.platform);
+    const key = JSON.stringify([input.platform, input.deviceId]);
+    const previous = failedOpens.get(key);
+    if (previous) {
+      await previous.close(true);
+      failedOpens.delete(key);
+    }
+    const externalNode = await waitWithSignal(node(), signal);
+    const paths = await waitWithSignal(helpers(externalNode), signal);
+    signal.throwIfAborted();
+    const { deviceId, bootedByUs } = await backend.ensureBooted(
+      input.deviceId,
+      input.boot ?? false,
+      signal,
+    );
+    const resources = new DeviceResources(backend, deviceId, bootedByUs);
+    failedOpens.set(key, resources);
+    const handle = registry.create(input.platform, deviceId);
+    const startup = new AbortController();
+    const startupSignal = AbortSignal.any([startup.signal, signal]);
+    let initialized = false;
+    try {
+      signal.throwIfAborted();
+      const env = backend.env;
+      const hubOptions = {
+        externalNode,
+        hubCli: paths.hubCli,
+        platform: input.platform,
+        deviceId,
+        env,
+      };
+      const hub = await (dependencies.hub ?? startHub)({
+        ...hubOptions,
+        signal,
+        onCleanupFailure: (stop) => resources.retainStop(stop),
+      });
+      const connection = new HubConnection({
+        initial: hub,
+        options: hubOptions,
+        start: dependencies.hub,
+        ready: (stream, signal) => backend.streamReady(stream, signal),
+        onExit: () => {
+          registry.invalidate(handle);
+          if (!initialized)
+            startup.abort(deviceError("helper-failed", "Device capture exited during startup."));
+        },
+      });
+      resources.hub = connection;
+      const stateDir = join(stateRoot, handle.token);
+      resources.stateDir = stateDir;
+      await mkdir(stateDir, { recursive: true, mode: 0o700 });
+      const automation = (dependencies.automation ?? createAutomation)({
+        externalNode,
+        agentDeviceBin: paths.agentDeviceBin,
+        platform: input.platform,
+        deviceId,
+        stateDir,
+        env,
+      });
+      resources.automation = automation;
+      const cancelStartup = (error: unknown): never => {
+        startup.abort(error);
+        throw error;
+      };
+      const [, controls] = await Promise.allSettled([
+        backend.streamReady(hub.descriptor, startupSignal).catch(cancelStartup),
+        openAutomation(automation, startupSignal).catch(cancelStartup),
+      ]);
+      startupSignal.throwIfAborted();
+      if (controls.status === "rejected") throw controls.reason;
+      await connection.descriptor(startupSignal);
+      const capabilities = controls.value;
+      initialized = true;
+      attachments.set(handle.token, {
+        handle,
+        backend,
+        hub: connection,
+        automation,
+        capabilities,
+        stateDir,
+        resources,
+      });
+      failedOpens.delete(key);
+      return { handle, capabilities };
+    } catch (error) {
+      registry.release(handle);
+      await resources.close(true);
+      failedOpens.delete(key);
+      throw error;
+    }
   }
 }
 
@@ -448,26 +320,18 @@ async function openAutomation(
     await automation.run(["open", "--no-test-ime", "--no-record"], undefined, signal),
     "Opening the automation session",
   );
-  return readCapabilities(automation, signal);
-}
-
-// Read only capabilities reported by the automation engine. Streaming is a separate backend.
-async function readCapabilities(
-  automation: Automation,
-  signal?: AbortSignal,
-): Promise<Device.Capabilities> {
+  // The automation report contains unique control capabilities; streaming belongs to the capture backend.
   const result = await automation.run(capabilitiesArgs(), undefined, signal).catch(() => null);
   signal?.throwIfAborted();
   const reported = result && result.code === 0 ? parseCapabilities(result.stdout) : null;
-  const base = (reported ?? []).filter((capability) => capability !== "stream");
-  const supported = [...new Set<Device.Capability>([...base, "stream"])];
-  const unsupported = ALL_CAPABILITIES.filter((capability) => !supported.includes(capability)).map(
-    (capability) => ({
+  const supported: Device.Capability[] = [...(reported ?? []), "stream"];
+  const unsupported = Device.Capability.literals
+    .filter((capability) => !supported.includes(capability))
+    .map((capability) => ({
       capability,
       reason: reported
         ? "Not reported by the device's automation engine."
         : "The automation engine did not return a readable capability report.",
-    }),
-  );
+    }));
   return { supported, unsupported };
 }

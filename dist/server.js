@@ -359,12 +359,23 @@ var ControlRpc = Rpc.define({
   events: { control: { schema: standard(Control) } }
 });
 
+// src/deadlines.ts
+var DEVICE_OPERATION_TIMEOUT_MS = 120000;
+var DEVICE_REQUEST_TIMEOUT_MS = DEVICE_OPERATION_TIMEOUT_MS + 15000;
+
 // src/server.ts
 var unavailable = (call, code, message) => call.error("unavailable", message, { code, message, mayHaveExecuted: false });
+var adopt = Effect.fnUntraced(function* (device, operation) {
+  if (device.handle.platform !== operation.platform || device.handle.deviceId !== operation.deviceId)
+    return yield* new Tool.Error({
+      message: "[device.unavailable] A different device is attached to this session. The agent can only adopt the device already open in the desktop app. Call the state tool to read the attached device."
+    });
+  return { type: "attachment", attachment: device };
+});
 var make = Effect.fn("DeviceServer.make")(function* (ctx) {
   const attachments = new Map;
   let active = true;
-  const close = (sessionID2, reason = "closed") => Effect.gen(function* () {
+  const close = Effect.fnUntraced(function* (sessionID2, reason = "closed") {
     const attachment = attachments.get(sessionID2);
     if (!attachment)
       return;
@@ -424,7 +435,8 @@ var make = Effect.fn("DeviceServer.make")(function* (ctx) {
         return;
       if (input.outcome.type === "failure")
         return yield* Deferred.fail(pending.result, new Tool.Error({
-          message: `[device.${input.outcome.error.code}] ${input.outcome.error.message}`
+          message: `[device.${input.outcome.error.code}] ${input.outcome.error.message}${input.outcome.error.mayHaveExecuted ? " The action may already have run. Re-read device state before retrying a mutating action." : ""}`,
+          error: input.outcome.error
         })).pipe(Effect.asVoid);
       yield* Deferred.succeed(pending.result, input.outcome.value);
     }).pipe(Effect.asVoid)
@@ -444,9 +456,9 @@ var make = Effect.fn("DeviceServer.make")(function* (ctx) {
       connectionID: attachment.connectionID,
       requestID
     })), Effect.ignore)), Effect.timeoutOrElse({
-      duration: "60 seconds",
+      duration: DEVICE_REQUEST_TIMEOUT_MS,
       orElse: () => new Tool.Error({
-        message: `[device.timeout] device.${operation.type} did not finish within 60 seconds; its outcome is unknown. Check the desktop connection and re-read device state before repeating a mutating action.`
+        message: `[device.timeout] device.${operation.type} did not finish within ${DEVICE_REQUEST_TIMEOUT_MS / 1000} seconds; its outcome is unknown. Check the desktop connection and re-read device state before repeating a mutating action.`
       })
     }), Effect.ensuring(Effect.sync(() => void attachment.pending.delete(requestID))));
   });
@@ -467,13 +479,8 @@ var make = Effect.fn("DeviceServer.make")(function* (ctx) {
           message: "[device.denied] This session does not have device access. Grant device access to this session in the desktop app, then retry."
         });
       const device = attachment.state;
-      if (operation.type === "open") {
-        if (device.handle.platform !== operation.platform || device.handle.deviceId !== operation.deviceId)
-          return yield* new Tool.Error({
-            message: "[device.unavailable] A different device is attached to this session. The agent can only adopt the device already open in the desktop app. Call the state tool to read the attached device."
-          });
-        return { type: "attachment", attachment: device };
-      }
+      if (operation.type === "open")
+        return yield* adopt(device, operation);
       if (!exports_rpc.sameHandle(device.handle, operation.handle))
         return yield* new Tool.Error({
           message: "[device.detached] This device handle no longer matches the attached device. Call the state tool to read the current handle, then retry with it."

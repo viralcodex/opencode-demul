@@ -23,7 +23,8 @@ Add this entry to your OpenCode configuration.
 
 ```json
 {
-  "plugins": ["github:viralcodex/opencode-demul#v0.3.0"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["github:viralcodex/opencode-demul#v0.4.0"]
 }
 ```
 
@@ -67,7 +68,7 @@ The first iOS automation command builds the agent's XCTest runner, which can tak
 
 Prebuilt plugin files are included.
 
-[Release notes for v0.3.0](https://github.com/viralcodex/opencode-demul/releases/tag/v0.3.0).
+[Release notes for v0.4.0](https://github.com/viralcodex/opencode-demul/releases/tag/v0.4.0).
 
 ## Development
 
